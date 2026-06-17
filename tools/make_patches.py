@@ -20,7 +20,7 @@ def uid():
 
 def axon(params, pos):
     return {"id": uid(), "plugin": "Axon", "model": "Axon",
-            "version": "2.0.0", "params": params, "pos": pos}
+            "version": "2.1.0", "params": params, "pos": pos}
 
 def ap(pitch=0.0, current=0.6, eps=0.08, shape=0.7, current_att=0.0, eps_att=0.0):
     return [
@@ -112,7 +112,66 @@ def patch_crossmod():
     ]
     write_patch("axon_4_crossmod.vcv", [vco, x, a], cs, a["id"])
 
+# ── Soma (Hindmarsh-Rose) ─────────────────────────────────────────────────────
+# Soma positional ids (match enum order in src/Soma.cpp):
+#   ParamId : 0 PITCH, 1 CURRENT, 2 BURST(=log2 r), 3 ADAPT, 4 CURRENT_ATT, 5 BURST_ATT
+#   InputId : 0 VOCT, 1 CURRENT, 2 BURST, 3 TRIG
+#   OutputId: 0 OUT, 1 SPIKE, 2 Z
+import math
+
+def soma(params, pos):
+    return {"id": uid(), "plugin": "Axon", "model": "Soma",
+            "version": "2.1.0", "params": params, "pos": pos}
+
+def sp(pitch=0.0, current=2.0, r=0.006, adapt=4.0, current_att=0.0, burst_att=0.0):
+    return [
+        {"id": 0, "value": float(pitch)},
+        {"id": 1, "value": float(current)},
+        {"id": 2, "value": float(math.log2(r))},   # BURST stores log2(r)
+        {"id": 3, "value": float(adapt)},
+        {"id": 4, "value": float(current_att)},
+        {"id": 5, "value": float(burst_att)},
+    ]
+
+def patch_soma_bursting():
+    x = soma(sp(current=2.0, r=0.006, adapt=4.0), [0, 0])
+    a = audio([12, 0])
+    cs = [cable(x["id"], 0, a["id"], 0, 0), cable(x["id"], 0, a["id"], 1, 1)]
+    write_patch("soma_1_bursting.vcv", [x, a], cs, a["id"])
+
+def patch_soma_chaos():
+    x = soma(sp(current=3.25, r=0.006, adapt=4.0), [0, 0])
+    a = audio([12, 0])
+    cs = [cable(x["id"], 0, a["id"], 0, 0), cable(x["id"], 0, a["id"], 1, 1)]
+    write_patch("soma_2_chaos.vcv", [x, a], cs, a["id"])
+
+def patch_soma_blips():
+    lfo = {"id": uid(), "plugin": "Fundamental", "model": "LFO", "version": "2.6.4",
+           "params": [{"id": 2, "value": -0.5}], "pos": [0, 0]}       # FREQ ~ 0.7 Hz
+    x = soma(sp(current=0.6, r=0.006, adapt=4.0), [6, 0])             # sub-threshold; trig fires a burst
+    a = audio([18, 0])
+    cs = [
+        cable(lfo["id"], 3, x["id"], 3, 0),   # LFO SQR -> Soma TRIG
+        cable(x["id"], 0, a["id"], 0, 1),
+        cable(x["id"], 0, a["id"], 1, 2),
+    ]
+    write_patch("soma_3_blips.vcv", [lfo, x, a], cs, a["id"])
+
+def patch_soma_zmod():
+    # Burst-envelope feedback: Z drives CURRENT CV, so the slow adaptation steers
+    # the module between regimes — a self-evolving bursting texture.
+    x = soma(sp(current=2.2, r=0.004, adapt=4.0, current_att=0.6), [0, 0])
+    a = audio([12, 0])
+    cs = [
+        cable(x["id"], 2, x["id"], 1, 0),     # Soma Z -> Soma CURRENT CV (self-patch)
+        cable(x["id"], 0, a["id"], 0, 1),
+        cable(x["id"], 0, a["id"], 1, 2),
+    ]
+    write_patch("soma_4_zmod.vcv", [x, a], cs, a["id"])
+
 if __name__ == "__main__":
     print("Generating Axon smoke-test patches:")
     patch_freerun(); patch_blips(); patch_selfevolving(); patch_crossmod()
+    print("Generating Soma smoke-test patches:")
+    patch_soma_bursting(); patch_soma_chaos(); patch_soma_blips(); patch_soma_zmod()
     print("Done.")

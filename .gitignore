@@ -1,0 +1,19 @@
+# Build output
+/build/
+/dist/
+/dep/
+plugin.so
+plugin.dll
+plugin.dylib
+
+# WSL "downloaded from the internet" marker files
+*Zone.Identifier
+
+# Claude Code local settings
+.claude/
+
+# Internal design/build notes (not published)
+AXON_implementation_plan.md
+
+# Output of tools/panel_diagram.py
+axon_panel.png

@@ -1,0 +1,28 @@
+{
+  "slug": "Axon",
+  "name": "Axon",
+  "version": "2.0.0",
+  "license": "GPL-3.0-only",
+  "brand": "Axon",
+  "author": "Jeremy Gray",
+  "authorEmail": "jeremycgray@gmail.com",
+  "authorUrl": "https://github.com/jeremycg",
+  "pluginUrl": "",
+  "manualUrl": "",
+  "sourceUrl": "https://github.com/jeremycg/axon",
+  "changelogUrl": "",
+  "modules": [
+    {
+      "slug": "Axon",
+      "name": "Axon",
+      "description": "Spiking-neuron oscillator on the FitzHugh-Nagumo system: relaxation oscillator + excitable (trigger-fired) voice",
+      "manualUrl": "",
+      "modularGridUrl": "",
+      "tags": [
+        "Oscillator",
+        "Synth Voice",
+        "Physical Modeling"
+      ]
+    }
+  ]
+}

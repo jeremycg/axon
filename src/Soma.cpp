@@ -62,6 +62,8 @@ struct Soma : Module {
     dsp::PulseGenerator spikeGen;
     dsp::TRCFilter<float> dcBlock;
     float lastFs = 0.f;
+    float trigDecay = 0.f;            // cached per-sample TRIG pulse decay (fn of fs)
+    float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
 
     // ─── Display trail (x,z phase portrait) ─────────────────────────────────
     float trailX[TRAIL] = {}, trailZ[TRAIL] = {};
@@ -142,6 +144,15 @@ struct Soma : Module {
     void process(const ProcessArgs& args) override {
         const float fs = args.sampleRate;
 
+        // SR-derived coefficients, recomputed only on a sample-rate change (no
+        // onSampleRateChange handler needed). Caching trigDecay keeps a
+        // transcendental off the per-sample path.
+        if (fs != lastFs) {
+            dcBlock.setCutoffFreq(20.f / fs);
+            trigDecay = std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
+            lastFs = fs;
+        }
+
         // ── params → physics ──
         float I = params[CURRENT_PARAM].getValue()
                 + inputs[CURRENT_INPUT].getVoltage() * params[CURRENT_ATT_PARAM].getValue() * CV_DEPTH;
@@ -155,7 +166,9 @@ struct Soma : Module {
         if (trigIn.process(inputs[TRIG_INPUT].getVoltage(), 0.1f, 1.f))
             trigPulse = TRIG_AMP;
         float Itot = I + trigPulse;
-        trigPulse *= std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
+        // cached decay coefficient; flush to zero once negligible (anti-denormal).
+        trigPulse *= trigDecay;
+        if (std::fabs(trigPulse) < 1e-30f) trigPulse = 0.f;
 
         // ── pitch = simulation speed (open-loop; tracks within-burst spike rate) ──
         float pitchHz = dsp::FREQ_C4 * std::exp2(
@@ -177,8 +190,11 @@ struct Soma : Module {
         zz = clamp(zz, -STATE_MAX, STATE_MAX);
 
         // ── outputs ──
-        if (fs != lastFs) { dcBlock.setCutoffFreq(20.f / fs); lastFs = fs; }
-        dcBlock.process(xx);
+        // Alternating sub-LSB dither keeps the DC-blocker's recursive state off
+        // denormals when x is parked at rest (sub-threshold, no triggers);
+        // ~1e-18 V is inaudible but well above the denormal floor.
+        antiDenorm = -antiDenorm;
+        dcBlock.process(xx + antiDenorm);
         outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock.highpass() * OUT_GAIN));
 
         if (spikeDet.process(xx, 0.f, SPIKE_THRESH))

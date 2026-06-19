@@ -58,7 +58,9 @@ struct Axon : Module {
     dsp::SchmittTrigger spikeDet;     // detects v crossing SPIKE_THRESH upward
     dsp::PulseGenerator spikeGen;     // shapes the SPIKE output pulse
     dsp::TRCFilter<float> dcBlock;    // DC blocker on OUT (limit-cycle mean ≠ 0)
-    float lastFs = 0.f;               // detects SR change to refresh dcBlock cutoff
+    float lastFs = 0.f;               // detects SR change to refresh coefficients
+    float trigDecay = 0.f;            // cached per-sample TRIG pulse decay (fn of fs)
+    float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
 
     // ─── Display trail (phase portrait) ─────────────────────────────────────
     // The audio thread appends decimated (v,w) points to a ring; the UI thread
@@ -135,6 +137,15 @@ struct Axon : Module {
     void process(const ProcessArgs& args) override {
         const float fs = args.sampleRate;
 
+        // SR-derived coefficients, recomputed only on a sample-rate change (no
+        // onSampleRateChange handler needed). Caching trigDecay keeps a
+        // transcendental off the per-sample path.
+        if (fs != lastFs) {
+            dcBlock.setCutoffFreq(20.f / fs);
+            trigDecay = std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
+            lastFs = fs;
+        }
+
         // ── params → physics ──
         float eps = clamp(params[EPS_PARAM].getValue()
                         + inputs[EPS_INPUT].getVoltage() * params[EPS_ATT_PARAM].getValue() * CV_DEPTH,
@@ -148,8 +159,10 @@ struct Axon : Module {
         if (trigIn.process(inputs[TRIG_INPUT].getVoltage(), 0.1f, 1.f))
             trigPulse = TRIG_AMP;
         float Itot = I + trigPulse;
-        // decay the pulse once per sample
-        trigPulse *= std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
+        // decay the pulse once per sample (cached coefficient); flush to zero once
+        // negligible so a long rest doesn't grind the multiply on denormals.
+        trigPulse *= trigDecay;
+        if (std::fabs(trigPulse) < 1e-30f) trigPulse = 0.f;
 
         // ── pitch = simulation speed (open-loop) ──
         float pitchHz = dsp::FREQ_C4 * std::exp2(
@@ -168,11 +181,11 @@ struct Axon : Module {
         ww = clamp(ww, -STATE_MAX, STATE_MAX);
 
         // ── outputs ──
-        if (fs != lastFs) {                          // SR-change graceful (no onSampleRateChange)
-            dcBlock.setCutoffFreq(20.f / fs);
-            lastFs = fs;
-        }
-        dcBlock.process(vv);
+        // Alternating sub-LSB dither keeps the DC-blocker's recursive state off
+        // denormals when v is parked at the rest fixed point (sub-threshold, no
+        // triggers); ~1e-18 V is inaudible but well above the denormal floor.
+        antiDenorm = -antiDenorm;
+        dcBlock.process(vv + antiDenorm);
         outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock.highpass() * OUT_GAIN));
 
         // SchmittTrigger's two-arg form gives hysteresis so a noisy spike peak

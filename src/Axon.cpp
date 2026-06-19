@@ -1,5 +1,6 @@
 #include "plugin.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 
@@ -63,12 +64,18 @@ struct Axon : Module {
     float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
 
     // ─── Display trail (phase portrait) ─────────────────────────────────────
-    // The audio thread appends decimated (v,w) points to a ring; the UI thread
-    // reads dispV/dispW (refreshed ~45 Hz). Float tearing during the copy is
-    // harmless for a visualiser and the read no longer races a per-sample writer.
+    // The audio thread appends decimated (v,w) points to a ring, then ~45 Hz
+    // publishes a coherent snapshot into a double buffer: it fills the back
+    // buffer and flips dispBuf with a release store; the UI reads the front
+    // buffer after an acquire load. Lock-free and race-free, and the head index
+    // + effective CURRENT travel *with* the arrays, so the trail, head dot and
+    // nullcline stay mutually consistent (no live index against a stale copy).
     float trailV[TRAIL] = {}, trailW[TRAIL] = {};
     int   trailIdx = 0, trailDecim = 0;
-    float dispV[TRAIL] = {}, dispW[TRAIL] = {};
+    float dispV[2][TRAIL] = {}, dispW[2][TRAIL] = {};
+    int   dispHead[2] = {};
+    float dispCurr[2] = {0.6f, 0.6f};   // effective CURRENT (CV included) for the v-nullcline
+    std::atomic<int> dispBuf{0};
     int   dispClock = 0;
 
     // ─── Tunable constants (set by ear/scope at M7; RATE_CAL from tools/) ────
@@ -204,10 +211,14 @@ struct Axon : Module {
             trailW[trailIdx] = ww;
             trailIdx = (trailIdx + 1) % TRAIL;
         }
-        if (++dispClock >= (int)(fs / 45.f)) {       // refresh display snapshot ~45 Hz
+        if (++dispClock >= (int)(fs / 45.f)) {       // publish display snapshot ~45 Hz
             dispClock = 0;
-            std::copy(trailV, trailV + TRAIL, dispV);
-            std::copy(trailW, trailW + TRAIL, dispW);
+            int next = 1 - dispBuf.load(std::memory_order_relaxed);
+            std::copy(trailV, trailV + TRAIL, dispV[next]);
+            std::copy(trailW, trailW + TRAIL, dispW[next]);
+            dispHead[next] = trailIdx;
+            dispCurr[next] = I;
+            dispBuf.store(next, std::memory_order_release);
         }
     }
 };
@@ -252,8 +263,9 @@ struct PhaseDisplay : Widget {
             auto X = [&](float v) { return (v - VMIN) / (VMAX - VMIN) * box.size.x; };
             auto Y = [&](float w) { return box.size.y - (w - WMIN) / (WMAX - WMIN) * box.size.y; };
 
+            int b = module ? module->dispBuf.load(std::memory_order_acquire) : 0;
             float a = module ? module->params[Axon::SHAPE_PARAM].getValue() : 0.7f;
-            float I = module ? module->params[Axon::CURRENT_PARAM].getValue() : 0.6f;
+            float I = module ? module->dispCurr[b] : 0.6f;   // CV-included, coherent with the trail
 
             // v-nullcline: w = v - v³/3 + I  (the cubic). Where dv/dt = 0.
             nvgBeginPath(args.vg);
@@ -280,22 +292,24 @@ struct PhaseDisplay : Widget {
 
             // The trajectory trail, oldest→newest, brightening along its length.
             if (module) {
-                int idx = module->trailIdx;   // newest just before idx
+                const float* dv = module->dispV[b];
+                const float* dw = module->dispW[b];
+                int idx = module->dispHead[b];   // newest just before idx (coherent with dv/dw)
                 nvgLineCap(args.vg, NVG_ROUND);
                 for (int k = 1; k < TRAIL; k++) {
                     int i0 = (idx + k - 1) % TRAIL;
                     int i1 = (idx + k) % TRAIL;
                     float alpha = (float) k / TRAIL;   // older = dimmer
                     nvgBeginPath(args.vg);
-                    nvgMoveTo(args.vg, X(module->dispV[i0]), Y(module->dispW[i0]));
-                    nvgLineTo(args.vg, X(module->dispV[i1]), Y(module->dispW[i1]));
+                    nvgMoveTo(args.vg, X(dv[i0]), Y(dw[i0]));
+                    nvgLineTo(args.vg, X(dv[i1]), Y(dw[i1]));
                     nvgStrokeColor(args.vg, nvgRGBA(0x55, 0xc8, 0xff, (int)(alpha * 0xcc)));
                     nvgStrokeWidth(args.vg, 1.6f);
                     nvgStroke(args.vg);
                 }
                 // Bright head dot at the newest point.
                 int newest = (idx + TRAIL - 1) % TRAIL;
-                float hx = X(module->dispV[newest]), hy = Y(module->dispW[newest]);
+                float hx = X(dv[newest]), hy = Y(dw[newest]);
                 nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 4.f);
                 nvgFillColor(args.vg, nvgRGBA(0x9a, 0xe4, 0xff, 0x55)); nvgFill(args.vg);
                 nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 2.f);

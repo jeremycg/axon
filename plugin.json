@@ -7,33 +7,33 @@
   "author": "Jeremy Gray",
   "authorEmail": "jeremycgray@gmail.com",
   "authorUrl": "https://github.com/jeremycg",
-  "pluginUrl": "",
-  "manualUrl": "",
   "sourceUrl": "https://github.com/jeremycg/axon",
-  "changelogUrl": "",
+  "changelogUrl": "https://github.com/jeremycg/axon/blob/main/CHANGELOG.md",
   "modules": [
     {
       "slug": "Axon",
       "name": "Axon",
       "description": "Spiking-neuron oscillator on the FitzHugh-Nagumo system: relaxation oscillator + excitable (trigger-fired) voice",
-      "manualUrl": "",
-      "modularGridUrl": "",
       "tags": [
         "Oscillator",
-        "Synth Voice",
         "Physical Modeling"
+      ],
+      "keywords": [
+        "FitzHugh", "Nagumo", "FHN", "neuron", "spike", "excitable",
+        "relaxation", "oscillator", "phase portrait"
       ]
     },
     {
       "slug": "Soma",
       "name": "Soma",
       "description": "Bursting/chaotic neuron oscillator on the Hindmarsh-Rose system: spike trains, bursts, and chaos from one current control",
-      "manualUrl": "",
-      "modularGridUrl": "",
       "tags": [
         "Oscillator",
-        "Synth Voice",
         "Physical Modeling"
+      ],
+      "keywords": [
+        "Hindmarsh", "Rose", "HR", "neuron", "burst", "bursting",
+        "chaos", "adaptation", "oscillator", "phase portrait"
       ]
     }
   ]

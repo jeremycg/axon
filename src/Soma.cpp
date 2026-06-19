@@ -1,5 +1,6 @@
 #include "plugin.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 
@@ -66,9 +67,15 @@ struct Soma : Module {
     float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
 
     // ─── Display trail (x,z phase portrait) ─────────────────────────────────
+    // Double-buffered, lock-free snapshot (see Axon): the audio thread fills the
+    // back buffer and flips dispBuf with a release store; the UI reads the front
+    // buffer after an acquire load, with the head index carried alongside so the
+    // trail and head dot stay coherent.
     float trailX[TRAIL] = {}, trailZ[TRAIL] = {};
     int   trailIdx = 0, trailDecim = 0;
-    float dispX[TRAIL] = {}, dispZ[TRAIL] = {};
+    float dispX[2][TRAIL] = {}, dispZ[2][TRAIL] = {};
+    int   dispHead[2] = {};
+    std::atomic<int> dispBuf{0};
     int   dispClock = 0;
 
     // ─── Fixed HR parameters ────────────────────────────────────────────────
@@ -211,10 +218,13 @@ struct Soma : Module {
             trailZ[trailIdx] = zz;
             trailIdx = (trailIdx + 1) % TRAIL;
         }
-        if (++dispClock >= (int)(fs / 45.f)) {
+        if (++dispClock >= (int)(fs / 45.f)) {       // publish display snapshot ~45 Hz
             dispClock = 0;
-            std::copy(trailX, trailX + TRAIL, dispX);
-            std::copy(trailZ, trailZ + TRAIL, dispZ);
+            int next = 1 - dispBuf.load(std::memory_order_relaxed);
+            std::copy(trailX, trailX + TRAIL, dispX[next]);
+            std::copy(trailZ, trailZ + TRAIL, dispZ[next]);
+            dispHead[next] = trailIdx;
+            dispBuf.store(next, std::memory_order_release);
         }
     }
 };
@@ -262,21 +272,24 @@ struct SomaDisplay : Widget {
             nvgStroke(args.vg);
 
             if (module) {
-                int idx = module->trailIdx;
+                int b = module->dispBuf.load(std::memory_order_acquire);
+                const float* dx = module->dispX[b];
+                const float* dz = module->dispZ[b];
+                int idx = module->dispHead[b];   // coherent with dx/dz
                 nvgLineCap(args.vg, NVG_ROUND);
                 for (int k = 1; k < TRAIL; k++) {
                     int i0 = (idx + k - 1) % TRAIL;
                     int i1 = (idx + k) % TRAIL;
                     float alpha = (float) k / TRAIL;
                     nvgBeginPath(args.vg);
-                    nvgMoveTo(args.vg, X(module->dispX[i0]), Y(module->dispZ[i0]));
-                    nvgLineTo(args.vg, X(module->dispX[i1]), Y(module->dispZ[i1]));
+                    nvgMoveTo(args.vg, X(dx[i0]), Y(dz[i0]));
+                    nvgLineTo(args.vg, X(dx[i1]), Y(dz[i1]));
                     nvgStrokeColor(args.vg, nvgRGBA(0xff, 0x9b, 0x3a, (int)(alpha * 0xcc)));
                     nvgStrokeWidth(args.vg, 1.6f);
                     nvgStroke(args.vg);
                 }
                 int newest = (idx + TRAIL - 1) % TRAIL;
-                float hx = X(module->dispX[newest]), hy = Y(module->dispZ[newest]);
+                float hx = X(dx[newest]), hy = Y(dz[newest]);
                 nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 4.f);
                 nvgFillColor(args.vg, nvgRGBA(0xff, 0xc8, 0x88, 0x55)); nvgFill(args.vg);
                 nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 2.f);

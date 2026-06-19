@@ -1,7 +1,7 @@
 # Axon
 
 Spiking-neuron oscillators for VCV Rack 2. This plugin contains two sibling
-modules that share one RK4 integrator engine: **Axon** (FitzHugh–Nagumo — spiking
+modules that use the same RK4 integration strategy: **Axon** (FitzHugh–Nagumo — spiking
 and excitable) and **Soma** (Hindmarsh–Rose — bursting and chaos).
 
 ![Axon](doc/screenshot.png)
@@ -32,10 +32,12 @@ smoother, near-sinusoidal swing. **a** (SHAPE) shifts the asymmetry / threshold.
 
 The system is **stiff** (a fast variable riding a slow one), so the integrator is
 the real work: each sample takes a number of **RK4 substeps**, and that number
-adapts to pitch so the substep size stays bounded (`h ≤ 0.05`) no matter how fast
-you play. A finiteness reset + state clamp are the backstop if forcing ever pushes
-it to run away. The `f()` derivative and the RK4 step are factored so a planned
-**Hindmarsh–Rose** sibling (bursting/chaos) can reuse them with one extra equation.
+adapts to pitch to hold the substep size near `0.05` — up to a cap of 64 substeps,
+above which (roughly the top octave) the step grows and pitch trades some
+integration accuracy for bounded CPU. A finiteness reset + state clamp are the
+backstop if forcing ever pushes it to run away. The `f()` derivative and the RK4
+step are written so the **Hindmarsh–Rose** sibling (Soma) uses the same integration
+strategy with one extra equation.
 
 ### Pitch is the simulation *speed*
 
@@ -141,7 +143,7 @@ bursting → chaos. **BURST** (`r`) is how slow that adaptation is: small `r` = 
 slow bursts, large `r` → tonic spiking. **ADAPT** (`s`) is the adaptation strength
 (burst depth/shape). `a, b, c, d, x_R` are fixed at the standard HR values.
 
-It uses the **same integrator as Axon** — RK4 with pitch-adaptive substepping —
+It uses the **same RK4 integration strategy as Axon** — pitch-adaptive substepping —
 just with the third equation added.
 
 ### Pitch tracks the spike rate

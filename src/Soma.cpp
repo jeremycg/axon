@@ -21,6 +21,10 @@
 // the exposed bifurcation controls. The integrator (RK4 + pitch-adaptive
 // substepping) is the same engine as Axon, with one extra equation — the
 // factoring the Axon plan called for.
+//
+// Polyphonic: up to 16 independent HR voices, voice count from V/OCT (falling
+// back to TRIG). The display traces every active voice on its own hue, stepped
+// across a narrow band around Soma's amber accent.
 
 static const int TRAIL = 512;   // length of the (x,z) phase-portrait trail
 
@@ -55,13 +59,15 @@ struct Soma : Module {
         LIGHTS_LEN
     };
 
-    // ─── Persistent state ───────────────────────────────────────────────────
-    float xx = -1.6f, yy = -11.8f, zz = 2.f;   // HR state, seeded near the rest fixed point
-    float trigPulse = 0.f;
-    dsp::SchmittTrigger trigIn;
-    dsp::SchmittTrigger spikeDet;
-    dsp::PulseGenerator spikeGen;
-    dsp::TRCFilter<float> dcBlock;
+    // ─── Per-voice persistent state (polyphonic, up to 16 channels) ─────────
+    static const int MAX_POLY = 16;
+    float xx[MAX_POLY], yy[MAX_POLY], zz[MAX_POLY];  // HR state per voice
+    float trigPulse[MAX_POLY] = {};
+    dsp::SchmittTrigger trigIn[MAX_POLY];
+    dsp::SchmittTrigger spikeDet[MAX_POLY];
+    dsp::PulseGenerator spikeGen[MAX_POLY];
+    dsp::TRCFilter<float> dcBlock[MAX_POLY];
+    int   channels = 1;               // active voice count
     float lastFs = 0.f;
     float trigDecay = 0.f;            // cached per-sample TRIG pulse decay (fn of fs)
     float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
@@ -69,12 +75,13 @@ struct Soma : Module {
     // ─── Display trail (x,z phase portrait) ─────────────────────────────────
     // Double-buffered, lock-free snapshot (see Axon): the audio thread fills the
     // back buffer and flips dispBuf with a release store; the UI reads the front
-    // buffer after an acquire load, with the head index carried alongside so the
-    // trail and head dot stay coherent.
-    float trailX[TRAIL] = {}, trailZ[TRAIL] = {};
+    // buffer after an acquire load, with the head index and active-voice count
+    // carried alongside so trails and head dots stay coherent.
+    float trailX[MAX_POLY][TRAIL] = {}, trailZ[MAX_POLY][TRAIL] = {};
     int   trailIdx = 0, trailDecim = 0;
-    float dispX[2][TRAIL] = {}, dispZ[2][TRAIL] = {};
+    float dispX[2][MAX_POLY][TRAIL] = {}, dispZ[2][MAX_POLY][TRAIL] = {};
     int   dispHead[2] = {};
+    int   dispChannels[2] = {1, 1};
     std::atomic<int> dispBuf{0};
     int   dispClock = 0;
 
@@ -116,15 +123,15 @@ struct Soma : Module {
         configOutput(OUT_OUTPUT, "Audio (membrane potential x)");
         configOutput(SPIKE_OUTPUT, "Spike (trigger on each spike)");
         configOutput(Z_OUTPUT, "Adaptation z (burst-envelope CV)");
+
+        for (int c = 0; c < MAX_POLY; c++) { xx[c] = -1.6f; yy[c] = -11.8f; zz[c] = 2.f; }
     }
 
     void onReset() override {
-        xx = -1.6f; yy = -11.8f; zz = 2.f;
-        trigPulse = 0.f;
-        trigIn.reset();
-        spikeDet.reset();
-        spikeGen.reset();
-        dcBlock.reset();
+        for (int c = 0; c < MAX_POLY; c++) {
+            xx[c] = -1.6f; yy[c] = -11.8f; zz[c] = 2.f; trigPulse[c] = 0.f;
+            trigIn[c].reset(); spikeDet[c].reset(); spikeGen[c].reset(); dcBlock[c].reset();
+        }
     }
 
     // HR derivatives — the FHN f() with one extra (slow) line, as the Axon plan
@@ -155,75 +162,97 @@ struct Soma : Module {
         // onSampleRateChange handler needed). Caching trigDecay keeps a
         // transcendental off the per-sample path.
         if (fs != lastFs) {
-            dcBlock.setCutoffFreq(20.f / fs);
+            for (int c = 0; c < MAX_POLY; c++) dcBlock[c].setCutoffFreq(20.f / fs);
             trigDecay = std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
             lastFs = fs;
         }
 
-        // ── params → physics ──
-        float I = params[CURRENT_PARAM].getValue()
-                + inputs[CURRENT_INPUT].getVoltage() * params[CURRENT_ATT_PARAM].getValue() * CV_DEPTH;
-        // BURST is log₂(r); CV adds in the log domain (a multiplicative nudge on r).
-        float rLog = params[BURST_PARAM].getValue()
-                   + inputs[BURST_INPUT].getVoltage() * params[BURST_ATT_PARAM].getValue() * CV_DEPTH;
-        float r = clamp(std::exp2(rLog), R_MIN, R_MAX);
-        float s = params[ADAPT_PARAM].getValue();
+        // Voice count follows V/OCT, falling back to TRIG so a poly trigger
+        // (percussive bursts, no pitch cable) still spreads across voices.
+        channels = std::max({inputs[VOCT_INPUT].getChannels(),
+                             inputs[TRIG_INPUT].getChannels(), 1});
+        outputs[OUT_OUTPUT].setChannels(channels);
+        outputs[SPIKE_OUTPUT].setChannels(channels);
+        outputs[Z_OUTPUT].setChannels(channels);
 
-        // ── excitable trigger: rising edge injects a decaying current pulse ──
-        if (trigIn.process(inputs[TRIG_INPUT].getVoltage(), 0.1f, 1.f))
-            trigPulse = TRIG_AMP;
-        float Itot = I + trigPulse;
-        // cached decay coefficient; flush to zero once negligible (anti-denormal).
-        trigPulse *= trigDecay;
-        if (std::fabs(trigPulse) < 1e-30f) trigPulse = 0.f;
+        // Shared knob values; per-voice CV is added inside the loop.
+        const float Ibase     = params[CURRENT_PARAM].getValue();
+        const float Iatt      = params[CURRENT_ATT_PARAM].getValue();
+        const float rLogBase  = params[BURST_PARAM].getValue();
+        const float rAtt      = params[BURST_ATT_PARAM].getValue();
+        const float s         = params[ADAPT_PARAM].getValue();
+        const float pitchKnob = params[PITCH_PARAM].getValue();
 
-        // ── pitch = simulation speed (open-loop; tracks within-burst spike rate) ──
-        float pitchHz = dsp::FREQ_C4 * std::exp2(
-                            params[PITCH_PARAM].getValue() + inputs[VOCT_INPUT].getVoltage());
-        float dtau = RATE_CAL * pitchHz / fs;
-        int   K    = clamp((int) std::ceil(dtau / HSUB_MAX), MIN_SUB, MAX_SUB);
-        float h    = dtau / K;
-
-        // ── integrate K RK4 substeps ──
-        for (int k = 0; k < K; k++)
-            rk4(xx, yy, zz, h, Itot, r, s);
-
-        // ── backstop ──
-        if (!std::isfinite(xx) || !std::isfinite(yy) || !std::isfinite(zz)) {
-            xx = -1.6f; yy = -11.8f; zz = 2.f;
-        }
-        xx = clamp(xx, -STATE_MAX, STATE_MAX);
-        yy = clamp(yy, -STATE_MAX, STATE_MAX);
-        zz = clamp(zz, -STATE_MAX, STATE_MAX);
-
-        // ── outputs ──
-        // Alternating sub-LSB dither keeps the DC-blocker's recursive state off
-        // denormals when x is parked at rest (sub-threshold, no triggers);
-        // ~1e-18 V is inaudible but well above the denormal floor.
+        // Alternating sub-LSB dither (anti-denormal), toggled once per sample.
         antiDenorm = -antiDenorm;
-        dcBlock.process(xx + antiDenorm);
-        outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock.highpass() * OUT_GAIN));
 
-        if (spikeDet.process(xx, 0.f, SPIKE_THRESH))
-            spikeGen.trigger(1e-3f);
-        outputs[SPIKE_OUTPUT].setVoltage(spikeGen.process(args.sampleTime) ? 10.f : 0.f);
+        for (int c = 0; c < channels; c++) {
+            // ── params → physics (per voice) ──
+            float I = Ibase
+                    + inputs[CURRENT_INPUT].getPolyVoltage(c) * Iatt * CV_DEPTH;
+            // BURST is log₂(r); CV adds in the log domain (a multiplicative nudge on r).
+            float rLog = rLogBase
+                       + inputs[BURST_INPUT].getPolyVoltage(c) * rAtt * CV_DEPTH;
+            float r = clamp(std::exp2(rLog), R_MIN, R_MAX);
 
-        // Z is the slow adaptation variable — a burst-envelope CV (not high-passed).
-        outputs[Z_OUTPUT].setVoltage(clamp((zz - Z_CENTER) * Z_GAIN, -5.f, 5.f));
+            // ── excitable trigger: rising edge injects a decaying current pulse ──
+            if (trigIn[c].process(inputs[TRIG_INPUT].getPolyVoltage(c), 0.1f, 1.f))
+                trigPulse[c] = TRIG_AMP;
+            float Itot = I + trigPulse[c];
+            trigPulse[c] *= trigDecay;
+            if (std::fabs(trigPulse[c]) < 1e-30f) trigPulse[c] = 0.f;
 
-        // ── feed the (x,z) phase-portrait trail (decimated; bursts are slow) ──
+            // ── pitch = simulation speed (open-loop; tracks within-burst spike rate) ──
+            float pitchHz = dsp::FREQ_C4 * std::exp2(
+                                pitchKnob + inputs[VOCT_INPUT].getPolyVoltage(c));
+            float dtau = RATE_CAL * pitchHz / fs;
+            int   K    = clamp((int) std::ceil(dtau / HSUB_MAX), MIN_SUB, MAX_SUB);
+            float h    = dtau / K;
+
+            // ── integrate K RK4 substeps ──
+            float x = xx[c], y = yy[c], z = zz[c];
+            for (int k = 0; k < K; k++)
+                rk4(x, y, z, h, Itot, r, s);
+
+            // ── backstop ──
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+                x = -1.6f; y = -11.8f; z = 2.f;
+            }
+            x = clamp(x, -STATE_MAX, STATE_MAX);
+            y = clamp(y, -STATE_MAX, STATE_MAX);
+            z = clamp(z, -STATE_MAX, STATE_MAX);
+            xx[c] = x; yy[c] = y; zz[c] = z;
+
+            // ── outputs ──
+            dcBlock[c].process(x + antiDenorm);
+            outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock[c].highpass() * OUT_GAIN), c);
+
+            if (spikeDet[c].process(x, 0.f, SPIKE_THRESH))
+                spikeGen[c].trigger(1e-3f);
+            outputs[SPIKE_OUTPUT].setVoltage(spikeGen[c].process(args.sampleTime) ? 10.f : 0.f, c);
+
+            // Z is the slow adaptation variable — a burst-envelope CV (not high-passed).
+            outputs[Z_OUTPUT].setVoltage(clamp((z - Z_CENTER) * Z_GAIN, -5.f, 5.f), c);
+        }
+
+        // ── feed the (x,z) phase-portrait trails (all voices; decimated, bursts are slow) ──
         if (++trailDecim >= 6) {
             trailDecim = 0;
-            trailX[trailIdx] = xx;
-            trailZ[trailIdx] = zz;
+            for (int c = 0; c < channels; c++) {
+                trailX[c][trailIdx] = xx[c];
+                trailZ[c][trailIdx] = zz[c];
+            }
             trailIdx = (trailIdx + 1) % TRAIL;
         }
         if (++dispClock >= (int)(fs / 45.f)) {       // publish display snapshot ~45 Hz
             dispClock = 0;
             int next = 1 - dispBuf.load(std::memory_order_relaxed);
-            std::copy(trailX, trailX + TRAIL, dispX[next]);
-            std::copy(trailZ, trailZ + TRAIL, dispZ[next]);
+            for (int c = 0; c < channels; c++) {
+                std::copy(trailX[c], trailX[c] + TRAIL, dispX[next][c]);
+                std::copy(trailZ[c], trailZ[c] + TRAIL, dispZ[next][c]);
+            }
             dispHead[next] = trailIdx;
+            dispChannels[next] = channels;
             dispBuf.store(next, std::memory_order_release);
         }
     }
@@ -236,12 +265,21 @@ struct Soma : Module {
 // shows as a cluster of spikes climbing along z and the quiescent gap as the
 // slow return. In the chaotic window the trail never quite repeats. The faint
 // diagonal is the z-nullcline z = s·(x − x_R) (where the slow drift reverses).
+// With several voices patched, each attractor is drawn on its own hue stepped
+// across a narrow amber band.
 struct SomaDisplay : Widget {
     Soma* module = nullptr;
     std::shared_ptr<Font> font;
 
     static constexpr float XMIN = -2.0f, XMAX = 2.2f;
     static constexpr float ZMIN = 0.3f, ZMAX = 4.0f;
+
+    // Voice → hue (0..1) within a band centred on Soma's amber accent (~0.082).
+    static float voiceHue(int v, int nv) {
+        const float center = 0.082f, halfBand = 0.05f;
+        if (nv <= 1) return center;
+        return center - halfBand + 2.f * halfBand * v / (nv - 1);
+    }
 
     void draw(const DrawArgs& args) override {
         nvgBeginPath(args.vg);
@@ -262,6 +300,8 @@ struct SomaDisplay : Widget {
             auto Y = [&](float z) { return box.size.y - (z - ZMIN) / (ZMAX - ZMIN) * box.size.y; };
 
             float s = module ? module->params[Soma::ADAPT_PARAM].getValue() : 4.f;
+            int b  = module ? module->dispBuf.load(std::memory_order_acquire) : 0;
+            int nv = module ? module->dispChannels[b] : 1;
 
             // z-nullcline: z = s·(x − x_R).
             nvgBeginPath(args.vg);
@@ -272,28 +312,31 @@ struct SomaDisplay : Widget {
             nvgStroke(args.vg);
 
             if (module) {
-                int b = module->dispBuf.load(std::memory_order_acquire);
-                const float* dx = module->dispX[b];
-                const float* dz = module->dispZ[b];
-                int idx = module->dispHead[b];   // coherent with dx/dz
+                int idx = module->dispHead[b];   // coherent with arrays
+                float trailA = clamp(204.f - (nv - 1) * 6.f, 112.f, 204.f);  // 0x70..0xcc
                 nvgLineCap(args.vg, NVG_ROUND);
-                for (int k = 1; k < TRAIL; k++) {
-                    int i0 = (idx + k - 1) % TRAIL;
-                    int i1 = (idx + k) % TRAIL;
-                    float alpha = (float) k / TRAIL;
-                    nvgBeginPath(args.vg);
-                    nvgMoveTo(args.vg, X(dx[i0]), Y(dz[i0]));
-                    nvgLineTo(args.vg, X(dx[i1]), Y(dz[i1]));
-                    nvgStrokeColor(args.vg, nvgRGBA(0xff, 0x9b, 0x3a, (int)(alpha * 0xcc)));
-                    nvgStrokeWidth(args.vg, 1.6f);
-                    nvgStroke(args.vg);
+                for (int v = 0; v < nv; v++) {
+                    const float* dx = module->dispX[b][v];
+                    const float* dz = module->dispZ[b][v];
+                    float hue = voiceHue(v, nv);
+                    for (int k = 1; k < TRAIL; k++) {
+                        int i0 = (idx + k - 1) % TRAIL;
+                        int i1 = (idx + k) % TRAIL;
+                        float alpha = (float) k / TRAIL;
+                        nvgBeginPath(args.vg);
+                        nvgMoveTo(args.vg, X(dx[i0]), Y(dz[i0]));
+                        nvgLineTo(args.vg, X(dx[i1]), Y(dz[i1]));
+                        nvgStrokeColor(args.vg, nvgHSLA(hue, 0.95f, 0.60f, (int)(alpha * trailA)));
+                        nvgStrokeWidth(args.vg, 1.6f);
+                        nvgStroke(args.vg);
+                    }
+                    int newest = (idx + TRAIL - 1) % TRAIL;
+                    float hx = X(dx[newest]), hy = Y(dz[newest]);
+                    nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 4.f);
+                    nvgFillColor(args.vg, nvgHSLA(hue, 0.95f, 0.72f, 0x55)); nvgFill(args.vg);
+                    nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 2.f);
+                    nvgFillColor(args.vg, nvgHSLA(hue, 0.65f, 0.88f, 0xff)); nvgFill(args.vg);
                 }
-                int newest = (idx + TRAIL - 1) % TRAIL;
-                float hx = X(dx[newest]), hy = Y(dz[newest]);
-                nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 4.f);
-                nvgFillColor(args.vg, nvgRGBA(0xff, 0xc8, 0x88, 0x55)); nvgFill(args.vg);
-                nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 2.f);
-                nvgFillColor(args.vg, nvgRGB(0xff, 0xe0, 0xc0)); nvgFill(args.vg);
             } else {
                 // Browser preview: an illustrative bursting loop.
                 nvgBeginPath(args.vg);
@@ -318,6 +361,17 @@ struct SomaDisplay : Widget {
                 nvgTextAlign(args.vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
                 nvgText(args.vg, mm2px(2.6f), mm2px(2.2f), "SOMA", NULL);
                 nvgTextLetterSpacing(args.vg, 0.f);
+
+                // Voice-count badge when polyphonic.
+                if (nv > 1) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%dv", nv);
+                    nvgFontSize(args.vg, mm2px(2.2f));
+                    nvgFillColor(args.vg, nvgRGBA(0xb0, 0x80, 0x60, 0xcc));
+                    nvgTextAlign(args.vg, NVG_ALIGN_RIGHT | NVG_ALIGN_TOP);
+                    nvgText(args.vg, box.size.x - mm2px(2.4f), mm2px(2.2f), buf, NULL);
+                }
+
                 nvgFontSize(args.vg, mm2px(2.2f));
                 nvgFillColor(args.vg, nvgRGBA(0xb0, 0x80, 0x60, 0xaa));
                 nvgTextAlign(args.vg, NVG_ALIGN_RIGHT | NVG_ALIGN_BOTTOM);

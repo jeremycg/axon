@@ -17,6 +17,11 @@
 // substepping so the stiff relaxation spike stays accurate/stable as pitch
 // rises. f() and the RK4 step are factored so a Hindmarsh-Rose sibling (v2)
 // can reuse them with one extra state variable.
+//
+// Polyphonic: up to 16 independent FHN voices. The voice count follows V/OCT
+// (falling back to TRIG, so a poly trigger drives poly percussion even with no
+// pitch cable). The display traces every active voice, each on its own hue
+// stepped across a narrow band around the module's accent colour.
 
 // Length of the (v,w) phase-portrait trail shown on the display.
 static const int TRAIL = 512;
@@ -52,29 +57,35 @@ struct Axon : Module {
         LIGHTS_LEN
     };
 
-    // ─── Persistent state ───────────────────────────────────────────────────
-    float vv = -1.2f, ww = -0.6f;     // FHN state, seeded near the rest fixed point
-    float trigPulse = 0.f;            // decaying injected current from TRIG
-    dsp::SchmittTrigger trigIn;       // TRIG input edge detector (hysteresis window)
-    dsp::SchmittTrigger spikeDet;     // detects v crossing SPIKE_THRESH upward
-    dsp::PulseGenerator spikeGen;     // shapes the SPIKE output pulse
-    dsp::TRCFilter<float> dcBlock;    // DC blocker on OUT (limit-cycle mean ≠ 0)
+    // ─── Per-voice persistent state (polyphonic, up to 16 channels) ─────────
+    // Each voice is an independent FHN cell, so the integration state and the
+    // stateful DSP helpers (TRIG edge detect, spike detect/shaper, DC blocker)
+    // are one-per-voice. The voice count is driven by V/OCT (or TRIG).
+    static const int MAX_POLY = 16;
+    float vv[MAX_POLY], ww[MAX_POLY];          // FHN state per voice
+    float trigPulse[MAX_POLY] = {};            // decaying injected current from TRIG
+    dsp::SchmittTrigger trigIn[MAX_POLY];      // TRIG edge detector (hysteresis window)
+    dsp::SchmittTrigger spikeDet[MAX_POLY];    // detects v crossing SPIKE_THRESH upward
+    dsp::PulseGenerator spikeGen[MAX_POLY];    // shapes the SPIKE output pulse
+    dsp::TRCFilter<float> dcBlock[MAX_POLY];   // DC blocker on OUT (limit-cycle mean ≠ 0)
+    int   channels = 1;               // active voice count
     float lastFs = 0.f;               // detects SR change to refresh coefficients
     float trigDecay = 0.f;            // cached per-sample TRIG pulse decay (fn of fs)
     float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
 
     // ─── Display trail (phase portrait) ─────────────────────────────────────
-    // The audio thread appends decimated (v,w) points to a ring, then ~45 Hz
-    // publishes a coherent snapshot into a double buffer: it fills the back
-    // buffer and flips dispBuf with a release store; the UI reads the front
-    // buffer after an acquire load. Lock-free and race-free, and the head index
-    // + effective CURRENT travel *with* the arrays, so the trail, head dot and
-    // nullcline stay mutually consistent (no live index against a stale copy).
-    float trailV[TRAIL] = {}, trailW[TRAIL] = {};
+    // The audio thread appends decimated (v,w) points to a per-voice ring, then
+    // ~45 Hz publishes a coherent snapshot into a double buffer: it fills the
+    // back buffer and flips dispBuf with a release store; the UI reads the front
+    // buffer after an acquire load. Lock-free and race-free, and the head index,
+    // active-channel count and effective CURRENT travel *with* the arrays, so the
+    // trails, head dots and nullcline stay mutually consistent.
+    float trailV[MAX_POLY][TRAIL] = {}, trailW[MAX_POLY][TRAIL] = {};
     int   trailIdx = 0, trailDecim = 0;
-    float dispV[2][TRAIL] = {}, dispW[2][TRAIL] = {};
+    float dispV[2][MAX_POLY][TRAIL] = {}, dispW[2][MAX_POLY][TRAIL] = {};
     int   dispHead[2] = {};
-    float dispCurr[2] = {0.6f, 0.6f};   // effective CURRENT (CV included) for the v-nullcline
+    int   dispChannels[2] = {1, 1};
+    float dispCurr[2] = {0.6f, 0.6f};   // voice-0 effective CURRENT for the v-nullcline
     std::atomic<int> dispBuf{0};
     int   dispClock = 0;
 
@@ -110,16 +121,15 @@ struct Axon : Module {
         configOutput(OUT_OUTPUT, "Audio (membrane voltage v)");
         configOutput(SPIKE_OUTPUT, "Spike (trigger on each spike)");
         configOutput(W_OUTPUT, "Recovery w (slow CV)");
+
+        for (int c = 0; c < MAX_POLY; c++) { vv[c] = -1.2f; ww[c] = -0.6f; }
     }
 
     void onReset() override {
-        vv = -1.2f;
-        ww = -0.6f;
-        trigPulse = 0.f;
-        trigIn.reset();
-        spikeDet.reset();
-        spikeGen.reset();
-        dcBlock.reset();
+        for (int c = 0; c < MAX_POLY; c++) {
+            vv[c] = -1.2f; ww[c] = -0.6f; trigPulse[c] = 0.f;
+            trigIn[c].reset(); spikeDet[c].reset(); spikeGen[c].reset(); dcBlock[c].reset();
+        }
     }
 
     // FHN derivatives in dimensionless time. Factored so a Hindmarsh-Rose
@@ -148,76 +158,100 @@ struct Axon : Module {
         // onSampleRateChange handler needed). Caching trigDecay keeps a
         // transcendental off the per-sample path.
         if (fs != lastFs) {
-            dcBlock.setCutoffFreq(20.f / fs);
+            for (int c = 0; c < MAX_POLY; c++) dcBlock[c].setCutoffFreq(20.f / fs);
             trigDecay = std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
             lastFs = fs;
         }
 
-        // ── params → physics ──
-        float eps = clamp(params[EPS_PARAM].getValue()
-                        + inputs[EPS_INPUT].getVoltage() * params[EPS_ATT_PARAM].getValue() * CV_DEPTH,
-                          0.01f, 0.30f);
-        float a   = params[SHAPE_PARAM].getValue();   // no CV by design
-        float I   = params[CURRENT_PARAM].getValue()
-                  + inputs[CURRENT_INPUT].getVoltage() * params[CURRENT_ATT_PARAM].getValue() * CV_DEPTH;
+        // Voice count follows V/OCT, but fall back to TRIG so a poly trigger
+        // (percussion, no pitch cable) still spreads across voices.
+        channels = std::max({inputs[VOCT_INPUT].getChannels(),
+                             inputs[TRIG_INPUT].getChannels(), 1});
+        outputs[OUT_OUTPUT].setChannels(channels);
+        outputs[SPIKE_OUTPUT].setChannels(channels);
+        outputs[W_OUTPUT].setChannels(channels);
 
-        // ── excitable trigger: rising edge injects a decaying current pulse ──
-        // Hysteresis window (0.1..1V) so a DC-coupled / offset trigger can't latch.
-        if (trigIn.process(inputs[TRIG_INPUT].getVoltage(), 0.1f, 1.f))
-            trigPulse = TRIG_AMP;
-        float Itot = I + trigPulse;
-        // decay the pulse once per sample (cached coefficient); flush to zero once
-        // negligible so a long rest doesn't grind the multiply on denormals.
-        trigPulse *= trigDecay;
-        if (std::fabs(trigPulse) < 1e-30f) trigPulse = 0.f;
+        // Shared knob values; per-voice CV is added inside the loop.
+        const float a         = params[SHAPE_PARAM].getValue();   // no CV by design
+        const float epsBase   = params[EPS_PARAM].getValue();
+        const float epsAtt    = params[EPS_ATT_PARAM].getValue();
+        const float Ibase     = params[CURRENT_PARAM].getValue();
+        const float Iatt      = params[CURRENT_ATT_PARAM].getValue();
+        const float pitchKnob = params[PITCH_PARAM].getValue();
 
-        // ── pitch = simulation speed (open-loop) ──
-        float pitchHz = dsp::FREQ_C4 * std::exp2(
-                            params[PITCH_PARAM].getValue() + inputs[VOCT_INPUT].getVoltage());
-        float dtau = RATE_CAL * pitchHz / fs;                 // dimensionless advance / sample
-        int   K    = clamp((int) std::ceil(dtau / HSUB_MAX), MIN_SUB, MAX_SUB);  // adaptive substeps
-        float h    = dtau / K;
-
-        // ── integrate K RK4 substeps ──
-        for (int k = 0; k < K; k++)
-            rk4(vv, ww, h, Itot, eps, a);
-
-        // ── backstop: nonlinear systems can run away if pushed ──
-        if (!std::isfinite(vv) || !std::isfinite(ww)) { vv = -1.2f; ww = -0.6f; }
-        vv = clamp(vv, -STATE_MAX, STATE_MAX);
-        ww = clamp(ww, -STATE_MAX, STATE_MAX);
-
-        // ── outputs ──
-        // Alternating sub-LSB dither keeps the DC-blocker's recursive state off
-        // denormals when v is parked at the rest fixed point (sub-threshold, no
-        // triggers); ~1e-18 V is inaudible but well above the denormal floor.
+        // Alternating sub-LSB dither (anti-denormal), toggled once per sample;
+        // applied to every voice's DC blocker so a parked rest can't denormalise.
         antiDenorm = -antiDenorm;
-        dcBlock.process(vv + antiDenorm);
-        outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock.highpass() * OUT_GAIN));
 
-        // SchmittTrigger's two-arg form gives hysteresis so a noisy spike peak
-        // emits exactly one pulse, not a burst.
-        if (spikeDet.process(vv, 0.f, SPIKE_THRESH))
-            spikeGen.trigger(1e-3f);
-        outputs[SPIKE_OUTPUT].setVoltage(spikeGen.process(args.sampleTime) ? 10.f : 0.f);
+        float I0 = Ibase;   // voice-0 effective current, for the display nullcline
 
-        // W is a slow correlated CV — intentionally not high-passed.
-        outputs[W_OUTPUT].setVoltage(clamp(ww * W_GAIN, -5.f, 5.f));
+        for (int c = 0; c < channels; c++) {
+            // ── params → physics (per voice) ──
+            float eps = clamp(epsBase
+                            + inputs[EPS_INPUT].getPolyVoltage(c) * epsAtt * CV_DEPTH,
+                              0.01f, 0.30f);
+            float I   = Ibase
+                      + inputs[CURRENT_INPUT].getPolyVoltage(c) * Iatt * CV_DEPTH;
+            if (c == 0) I0 = I;
 
-        // ── feed the phase-portrait trail (decimated) ──
+            // ── excitable trigger: rising edge injects a decaying current pulse ──
+            // Hysteresis window (0.1..1V) so a DC-coupled / offset trigger can't latch.
+            if (trigIn[c].process(inputs[TRIG_INPUT].getPolyVoltage(c), 0.1f, 1.f))
+                trigPulse[c] = TRIG_AMP;
+            float Itot = I + trigPulse[c];
+            trigPulse[c] *= trigDecay;
+            if (std::fabs(trigPulse[c]) < 1e-30f) trigPulse[c] = 0.f;
+
+            // ── pitch = simulation speed (open-loop) ──
+            float pitchHz = dsp::FREQ_C4 * std::exp2(
+                                pitchKnob + inputs[VOCT_INPUT].getPolyVoltage(c));
+            float dtau = RATE_CAL * pitchHz / fs;                 // dimensionless advance / sample
+            int   K    = clamp((int) std::ceil(dtau / HSUB_MAX), MIN_SUB, MAX_SUB);
+            float h    = dtau / K;
+
+            // ── integrate K RK4 substeps ──
+            float v = vv[c], w = ww[c];
+            for (int k = 0; k < K; k++)
+                rk4(v, w, h, Itot, eps, a);
+
+            // ── backstop: nonlinear systems can run away if pushed ──
+            if (!std::isfinite(v) || !std::isfinite(w)) { v = -1.2f; w = -0.6f; }
+            v = clamp(v, -STATE_MAX, STATE_MAX);
+            w = clamp(w, -STATE_MAX, STATE_MAX);
+            vv[c] = v; ww[c] = w;
+
+            // ── outputs ──
+            dcBlock[c].process(v + antiDenorm);
+            outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock[c].highpass() * OUT_GAIN), c);
+
+            // Two-arg Schmitt gives hysteresis so a noisy peak emits one pulse.
+            if (spikeDet[c].process(v, 0.f, SPIKE_THRESH))
+                spikeGen[c].trigger(1e-3f);
+            outputs[SPIKE_OUTPUT].setVoltage(spikeGen[c].process(args.sampleTime) ? 10.f : 0.f, c);
+
+            // W is a slow correlated CV — intentionally not high-passed.
+            outputs[W_OUTPUT].setVoltage(clamp(w * W_GAIN, -5.f, 5.f), c);
+        }
+
+        // ── feed the phase-portrait trails (all active voices, decimated) ──
         if (++trailDecim >= 4) {
             trailDecim = 0;
-            trailV[trailIdx] = vv;
-            trailW[trailIdx] = ww;
+            for (int c = 0; c < channels; c++) {
+                trailV[c][trailIdx] = vv[c];
+                trailW[c][trailIdx] = ww[c];
+            }
             trailIdx = (trailIdx + 1) % TRAIL;
         }
         if (++dispClock >= (int)(fs / 45.f)) {       // publish display snapshot ~45 Hz
             dispClock = 0;
             int next = 1 - dispBuf.load(std::memory_order_relaxed);
-            std::copy(trailV, trailV + TRAIL, dispV[next]);
-            std::copy(trailW, trailW + TRAIL, dispW[next]);
+            for (int c = 0; c < channels; c++) {
+                std::copy(trailV[c], trailV[c] + TRAIL, dispV[next][c]);
+                std::copy(trailW[c], trailW[c] + TRAIL, dispW[next][c]);
+            }
             dispHead[next] = trailIdx;
-            dispCurr[next] = I;
+            dispChannels[next] = channels;
+            dispCurr[next] = I0;
             dispBuf.store(next, std::memory_order_release);
         }
     }
@@ -230,7 +264,8 @@ struct Axon : Module {
 // excitable. The v-nullcline (the cubic) and w-nullcline (the line) are drawn
 // as faint guides — their intersection is the fixed point whose stability the
 // CURRENT knob controls (the Hopf bifurcation). State is read lock-free from
-// the audio thread's snapshot — fine for a visualiser.
+// the audio thread's snapshot. With several voices patched, each orbit is drawn
+// on its own hue stepped across a narrow cyan band so the chord is legible.
 struct PhaseDisplay : Widget {
     Axon* module = nullptr;
     std::shared_ptr<Font> font;
@@ -240,6 +275,13 @@ struct PhaseDisplay : Widget {
     // space) so the limit cycle sits comfortably inside the screen.
     static constexpr float VMIN = -2.9f, VMAX = 2.9f;
     static constexpr float WMIN = -1.1f, WMAX = 2.7f;
+
+    // Voice → hue (0..1) within a band centred on Axon's cyan accent (~0.554).
+    static float voiceHue(int v, int nv) {
+        const float center = 0.554f, halfBand = 0.072f;
+        if (nv <= 1) return center;
+        return center - halfBand + 2.f * halfBand * v / (nv - 1);
+    }
 
     void draw(const DrawArgs& args) override {
         // Screen background + bezel (base, non-illuminated layer).
@@ -266,6 +308,7 @@ struct PhaseDisplay : Widget {
             int b = module ? module->dispBuf.load(std::memory_order_acquire) : 0;
             float a = module ? module->params[Axon::SHAPE_PARAM].getValue() : 0.7f;
             float I = module ? module->dispCurr[b] : 0.6f;   // CV-included, coherent with the trail
+            int nv = module ? module->dispChannels[b] : 1;
 
             // v-nullcline: w = v - v³/3 + I  (the cubic). Where dv/dt = 0.
             nvgBeginPath(args.vg);
@@ -290,30 +333,35 @@ struct PhaseDisplay : Widget {
             nvgStrokeWidth(args.vg, 1.f);
             nvgStroke(args.vg);
 
-            // The trajectory trail, oldest→newest, brightening along its length.
+            // The trajectory trails, one per active voice, oldest→newest brightening
+            // along their length. More voices → dimmer trails so they don't overwhelm.
             if (module) {
-                const float* dv = module->dispV[b];
-                const float* dw = module->dispW[b];
-                int idx = module->dispHead[b];   // newest just before idx (coherent with dv/dw)
+                int idx = module->dispHead[b];   // newest just before idx (coherent with arrays)
+                float trailA = clamp(204.f - (nv - 1) * 6.f, 112.f, 204.f);  // 0x70..0xcc
                 nvgLineCap(args.vg, NVG_ROUND);
-                for (int k = 1; k < TRAIL; k++) {
-                    int i0 = (idx + k - 1) % TRAIL;
-                    int i1 = (idx + k) % TRAIL;
-                    float alpha = (float) k / TRAIL;   // older = dimmer
-                    nvgBeginPath(args.vg);
-                    nvgMoveTo(args.vg, X(dv[i0]), Y(dw[i0]));
-                    nvgLineTo(args.vg, X(dv[i1]), Y(dw[i1]));
-                    nvgStrokeColor(args.vg, nvgRGBA(0x55, 0xc8, 0xff, (int)(alpha * 0xcc)));
-                    nvgStrokeWidth(args.vg, 1.6f);
-                    nvgStroke(args.vg);
+                for (int v = 0; v < nv; v++) {
+                    const float* dv = module->dispV[b][v];
+                    const float* dw = module->dispW[b][v];
+                    float hue = voiceHue(v, nv);
+                    for (int k = 1; k < TRAIL; k++) {
+                        int i0 = (idx + k - 1) % TRAIL;
+                        int i1 = (idx + k) % TRAIL;
+                        float alpha = (float) k / TRAIL;   // older = dimmer
+                        nvgBeginPath(args.vg);
+                        nvgMoveTo(args.vg, X(dv[i0]), Y(dw[i0]));
+                        nvgLineTo(args.vg, X(dv[i1]), Y(dw[i1]));
+                        nvgStrokeColor(args.vg, nvgHSLA(hue, 0.85f, 0.62f, (int)(alpha * trailA)));
+                        nvgStrokeWidth(args.vg, 1.6f);
+                        nvgStroke(args.vg);
+                    }
+                    // Bright head dot at the newest point.
+                    int newest = (idx + TRAIL - 1) % TRAIL;
+                    float hx = X(dv[newest]), hy = Y(dw[newest]);
+                    nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 4.f);
+                    nvgFillColor(args.vg, nvgHSLA(hue, 0.85f, 0.72f, 0x55)); nvgFill(args.vg);
+                    nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 2.f);
+                    nvgFillColor(args.vg, nvgHSLA(hue, 0.55f, 0.88f, 0xff)); nvgFill(args.vg);
                 }
-                // Bright head dot at the newest point.
-                int newest = (idx + TRAIL - 1) % TRAIL;
-                float hx = X(dv[newest]), hy = Y(dw[newest]);
-                nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 4.f);
-                nvgFillColor(args.vg, nvgRGBA(0x9a, 0xe4, 0xff, 0x55)); nvgFill(args.vg);
-                nvgBeginPath(args.vg); nvgCircle(args.vg, hx, hy, 2.f);
-                nvgFillColor(args.vg, nvgRGB(0xc0, 0xee, 0xff)); nvgFill(args.vg);
             } else {
                 // Browser preview: a static demo orbit.
                 nvgBeginPath(args.vg);
@@ -338,6 +386,17 @@ struct PhaseDisplay : Widget {
                 nvgTextAlign(args.vg, NVG_ALIGN_LEFT | NVG_ALIGN_TOP);
                 nvgText(args.vg, mm2px(2.6f), mm2px(2.2f), "AXON", NULL);
                 nvgTextLetterSpacing(args.vg, 0.f);
+
+                // Voice-count badge when polyphonic.
+                if (nv > 1) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%dv", nv);
+                    nvgFontSize(args.vg, mm2px(2.2f));
+                    nvgFillColor(args.vg, nvgRGBA(0x60, 0x80, 0xb0, 0xcc));
+                    nvgTextAlign(args.vg, NVG_ALIGN_RIGHT | NVG_ALIGN_TOP);
+                    nvgText(args.vg, box.size.x - mm2px(2.4f), mm2px(2.2f), buf, NULL);
+                }
+
                 nvgFontSize(args.vg, mm2px(2.2f));
                 nvgFillColor(args.vg, nvgRGBA(0x60, 0x80, 0xb0, 0xaa));
                 nvgTextAlign(args.vg, NVG_ALIGN_RIGHT | NVG_ALIGN_BOTTOM);

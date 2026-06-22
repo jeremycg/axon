@@ -3,6 +3,17 @@
 All notable changes to this plugin are documented here. Versions follow the
 Rack-2 `MAJOR.MINOR.REVISION` convention.
 
+## 2.2.0
+
+- **Polyphony** — both Axon and Soma are now polyphonic, up to 16 independent
+  voices. The voice count follows the V/OCT cable (falling back to TRIG, so a
+  polyphonic trigger drives polyphonic percussion with no pitch patched). Every
+  CV input reads per-voice (normalled to channel 0), and OUT / SPIKE / W (Z)
+  are polyphonic.
+- **Display** now traces *every* active voice — each orbit on its own hue
+  stepped across a narrow band around the module accent (cyan for Axon, amber
+  for Soma) — with a voice-count badge in the corner.
+
 ## 2.1.0
 
 - **New module: Soma** — a Hindmarsh-Rose bursting/chaotic neuron oscillator,

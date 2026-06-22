@@ -4,6 +4,8 @@ Spiking-neuron oscillators for VCV Rack 2. This plugin contains two sibling
 modules that use the same RK4 integration strategy: **Axon** (FitzHugh–Nagumo — spiking
 and excitable) and **Soma** (Hindmarsh–Rose — bursting and chaos).
 
+Both are **polyphonic** (up to 16 voices) — see [Polyphony](#polyphony) below.
+
 ![Axon](doc/screenshot.png)
 
 Axon is a voice built on the **FitzHugh–Nagumo** (FHN) model — a two-variable
@@ -197,7 +199,24 @@ alias at high notes, OUT DC-blocked / Z not).
 ## Deferred
 
 Hard-sync / reset input; closed-loop pitch tracking; per-spike velocity output;
-polyphony; a regime/MODE switch to recalibrate pitch to the burst (vs spike) rate.
+a regime/MODE switch to recalibrate pitch to the burst (vs spike) rate.
+
+## Polyphony
+
+Both modules are polyphonic, up to **16 voices**, each an independent neuron with
+its own integration state. The voice count is taken from the **V/OCT** cable's
+channel count, falling back to **TRIG** — so a polyphonic gate/trigger (with no
+pitch patched) gives you polyphonic percussion. Every CV input (CURRENT, EPS /
+BURST, TRIG) is read per voice and normalled to channel 0 when it carries fewer
+channels, and **OUT / SPIKE / W (Z)** are polyphonic. Knobs and attenuverters are
+shared across all voices.
+
+The display traces **every** active voice at once: each orbit is drawn on its own
+hue, stepped across a narrow band around the module's accent colour (cyan for
+Axon, amber for Soma), with a small `Nv` voice-count badge in the corner.
+
+Feed them from a polyphonic source (a poly MIDI→CV, or `VCV Split`/`Merge`) and
+sum the poly OUT with any mixer.
 
 ## References
 

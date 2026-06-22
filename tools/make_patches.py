@@ -3,13 +3,13 @@
 
 Axon positional ids (must match enum order in src/Axon.cpp):
   ParamId : 0 PITCH, 1 CURRENT, 2 EPS, 3 SHAPE, 4 CURRENT_ATT, 5 EPS_ATT
-  InputId : 0 VOCT, 1 CURRENT, 2 EPS, 3 TRIG
+  InputId : 0 VOCT, 1 CURRENT, 2 EPS, 3 TRIG, 4 SYNC
   OutputId: 0 OUT, 1 SPIKE, 2 W
 Axon is 12 HP wide → place downstream modules at x >= 12.
 
 Third-party enum orders (verified from Fundamental v2 source):
   LFO : FREQ_PARAM=2; SQR_OUTPUT=3                (6 HP)
-  VCO : FREQ_PARAM=2; PITCH_INPUT=0; SAW_OUTPUT=2  (10 HP)
+  VCO : FREQ_PARAM=2; PITCH_INPUT=0; SAW_OUTPUT=2; SQR_OUTPUT=3  (10 HP)
 """
 
 import json, os, io, glob, shutil, subprocess, sys, tarfile, tempfile, random
@@ -18,9 +18,16 @@ random.seed(11)
 def uid():
     return random.randint(1_000_000_000_000_000, 9_007_199_254_740_991)
 
+PLUGIN_VERSION = "2.3.0"
+
 def axon(params, pos):
     return {"id": uid(), "plugin": "Axon", "model": "Axon",
-            "version": "2.1.0", "params": params, "pos": pos}
+            "version": PLUGIN_VERSION, "params": params, "pos": pos}
+
+def vco(freq=0.0, pos=(0, 0)):
+    # Fundamental VCO as a hard-sync master: FREQ_PARAM=2, SQR_OUTPUT=3. 10 HP.
+    return {"id": uid(), "plugin": "Fundamental", "model": "VCO", "version": "2.6.4",
+            "params": [{"id": 2, "value": float(freq)}], "pos": list(pos)}
 
 def ap(pitch=0.0, current=0.6, eps=0.08, shape=0.7, current_att=0.0, eps_att=0.0):
     return [
@@ -112,6 +119,18 @@ def patch_crossmod():
     ]
     write_patch("axon_4_crossmod.vcv", [vco, x, a], cs, a["id"])
 
+# ── 5. Hard sync: a master VCO resets Axon each cycle (classic sync sweep) ─────
+def patch_sync():
+    master = vco(freq=-1.0, pos=(0, 0))                              # VCO master, ~C3
+    x = axon(ap(pitch=0.0, current=0.6, eps=0.08, shape=0.7), [10, 0])  # free-running
+    a = audio([22, 0])                                              # Axon spans 10..22
+    cs = [
+        cable(master["id"], 3, x["id"], 4, 0),   # VCO SQR -> Axon SYNC
+        cable(x["id"], 0, a["id"], 0, 1),         # Axon OUT -> L
+        cable(x["id"], 0, a["id"], 1, 2),         # Axon OUT -> R
+    ]
+    write_patch("axon_5_sync.vcv", [master, x, a], cs, a["id"])
+
 # ── Soma (Hindmarsh-Rose) ─────────────────────────────────────────────────────
 # Soma positional ids (match enum order in src/Soma.cpp):
 #   ParamId : 0 PITCH, 1 CURRENT, 2 BURST(=log2 r), 3 ADAPT, 4 CURRENT_ATT, 5 BURST_ATT
@@ -121,7 +140,7 @@ import math
 
 def soma(params, pos):
     return {"id": uid(), "plugin": "Axon", "model": "Soma",
-            "version": "2.1.0", "params": params, "pos": pos}
+            "version": PLUGIN_VERSION, "params": params, "pos": pos}
 
 def sp(pitch=0.0, current=2.0, r=0.006, adapt=4.0, current_att=0.0, burst_att=0.0):
     return [
@@ -169,9 +188,23 @@ def patch_soma_zmod():
     ]
     write_patch("soma_4_zmod.vcv", [x, a], cs, a["id"])
 
+# ── 5. Rhythmic sync: an LFO clocks SYNC, restarting each burst in time ────────
+def patch_soma_sync():
+    lfo = {"id": uid(), "plugin": "Fundamental", "model": "LFO", "version": "2.6.4",
+           "params": [{"id": 2, "value": 1.0}], "pos": [0, 0]}       # FREQ=1 → 2 Hz clock
+    x = soma(sp(current=2.0, r=0.006, adapt=4.0), [6, 0])            # bursting voicing
+    a = audio([18, 0])
+    cs = [
+        cable(lfo["id"], 3, x["id"], 4, 0),   # LFO SQR -> Soma SYNC (restarts the burst)
+        cable(x["id"], 0, a["id"], 0, 1),
+        cable(x["id"], 0, a["id"], 1, 2),
+    ]
+    write_patch("soma_5_sync.vcv", [lfo, x, a], cs, a["id"])
+
 if __name__ == "__main__":
     print("Generating Axon smoke-test patches:")
-    patch_freerun(); patch_blips(); patch_selfevolving(); patch_crossmod()
+    patch_freerun(); patch_blips(); patch_selfevolving(); patch_crossmod(); patch_sync()
     print("Generating Soma smoke-test patches:")
     patch_soma_bursting(); patch_soma_chaos(); patch_soma_blips(); patch_soma_zmod()
+    patch_soma_sync()
     print("Done.")

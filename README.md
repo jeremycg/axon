@@ -86,7 +86,7 @@ as CURRENT crosses into the oscillating band. The trail is read lock-free from a
 
 ## Patches
 
-`tools/make_patches.py` writes four smoke-test patches into `patches/` (and copies
+`tools/make_patches.py` writes five smoke-test patches into `patches/` (and copies
 them into the Windows Rack patches folder if present):
 
 - **axon_1_freerun** — default voicing → audio; play V/OCT
@@ -95,6 +95,8 @@ them into the Windows Rack patches folder if present):
 - **axon_3_selfevolving** — W self-patched into CURRENT CV: a slow wandering
   texture that rides its own recovery variable
 - **axon_4_crossmod** — VCO SAW into CURRENT CV for FM-like sidebands
+- **axon_5_sync** — a master VCO square clocking SYNC: hard sync. Sweep Axon's
+  PITCH against the master for the classic sync-sweep timbre
 
 ## Notes / known limits (v1)
 
@@ -192,12 +194,14 @@ window the trail never quite repeats. The faint diagonal is the `z`-nullcline
 
 ## Patches
 
-`tools/make_patches.py` also writes four Soma patches:
+`tools/make_patches.py` also writes five Soma patches:
 
 - **soma_1_bursting** — the default bursting voicing → audio
 - **soma_2_chaos** — CURRENT = 3.25, the classic HR chaotic regime
 - **soma_3_blips** — sub-threshold CURRENT, an LFO clocking TRIG to fire bursts
 - **soma_4_zmod** — Z self-patched into CURRENT CV: a self-evolving burst texture
+- **soma_5_sync** — an LFO clocking SYNC: each edge restarts the burst, locking it
+  to the clock (rhythmic hard reset)
 
 `tools/soma_stability_test.cpp` (calibration/stability/pitch) and
 `tools/soma_render_wav.cpp` (offline audition) are the Soma counterparts of Axon's

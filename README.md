@@ -98,7 +98,7 @@ them into the Windows Rack patches folder if present):
 - **axon_5_sync** — a master VCO square clocking SYNC: hard sync. Sweep Axon's
   PITCH against the master for the classic sync-sweep timbre
 
-## Notes / known limits (v1)
+## Notes / known limits
 
 - **Pitch is emergent / approximate.** CURRENT, EPS and SHAPE pull the pitch a
   little (see above) — deliberate, not a bug. Calibration targets C4 at the

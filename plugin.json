@@ -16,11 +16,12 @@
       "description": "Spiking-neuron oscillator on the FitzHugh-Nagumo system: relaxation oscillator + excitable (trigger-fired) voice",
       "tags": [
         "Oscillator",
-        "Physical Modeling"
+        "Physical Modeling",
+        "Polyphonic"
       ],
       "keywords": [
         "FitzHugh", "Nagumo", "FHN", "neuron", "spike", "excitable",
-        "relaxation", "oscillator", "phase portrait"
+        "relaxation", "oscillator", "phase portrait", "polyphonic", "sync"
       ]
     },
     {
@@ -29,11 +30,12 @@
       "description": "Bursting/chaotic neuron oscillator on the Hindmarsh-Rose system: spike trains, bursts, and chaos from one current control",
       "tags": [
         "Oscillator",
-        "Physical Modeling"
+        "Physical Modeling",
+        "Polyphonic"
       ],
       "keywords": [
         "Hindmarsh", "Rose", "HR", "neuron", "burst", "bursting",
-        "chaos", "adaptation", "oscillator", "phase portrait"
+        "chaos", "adaptation", "oscillator", "phase portrait", "polyphonic", "sync"
       ]
     }
   ]

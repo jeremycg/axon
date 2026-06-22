@@ -62,8 +62,11 @@ is deliberate and part of the instrument's character, not a bug.
 **CURRENT** and **EPS** each have an attenuverter + CV input (±5 V). **V/OCT**
 sums with PITCH (no attenuverter). **TRIG** injects a short decaying current pulse
 on each rising edge — from rest that fires one spike (percussion); inside the
-oscillating band it perturbs the phase. There is no mode switch: the regime is
-set purely by where CURRENT sits, and triggers are honoured in both.
+oscillating band it perturbs the phase. **SYNC** is a hard reset: a rising edge
+re-seeds the orbit at the rest fixed point, so clocking it locks the cycle (and
+sweeping a master against it gives the classic hard-sync timbre). There is no
+mode switch: the regime is set purely by where CURRENT sits, and triggers are
+honoured in both.
 
 Outputs: **OUT** — the membrane voltage `v`, soft-clipped to ±5 V (`tanh`) and
 internally DC-blocked at ~20 Hz (the limit cycle's mean is not zero). **SPIKE** —
@@ -98,9 +101,12 @@ them into the Windows Rack patches folder if present):
 - **Pitch is emergent / approximate.** CURRENT, EPS and SHAPE pull the pitch a
   little (see above) — deliberate, not a bug. Calibration targets C4 at the
   default voicing.
-- **Aliasing.** Spikes are sharp; the substep oversampling reduces but does not
-  eliminate aliasing, so high notes alias — a known v1 limit (v2: more
-  oversampling / BLEP on the spike).
+- **Aliasing.** Spikes are sharp and the `tanh` soft-clip adds harmonics, so high
+  notes can alias. The right-click **Anti-aliasing** option (Off / ×4 / ×8,
+  default ×4) oversamples the whole output chain — DC-block + tanh — and decimates
+  with a windowed-sinc FIR, which band-limits both the spike and the nonlinearity.
+  Higher factors cost more CPU (scaling with voice count); turn it Off if you're
+  CPU-bound and not playing high notes.
 - **State is not saved.** `v`, `w` are transient and re-seed at rest on load;
   params persist. Deliberate.
 - **DC.** OUT is DC-blocked (the limit-cycle mean ≠ 0). W is intentionally not
@@ -168,6 +174,8 @@ and CURRENT/BURST/ADAPT pull the pitch — open-loop and deliberate, like Axon.
 **CURRENT** and **BURST** have attenuverters + CV inputs. **V/OCT** sums with
 PITCH. **TRIG** injects a decaying current pulse on each rising edge — from a
 sub-threshold CURRENT that kicks off a single burst (a percussive HR voice).
+**SYNC** hard-resets the cell (all three state variables) to rest on a rising
+edge, for rhythmic locking and hard-sync timbres.
 
 Outputs: **OUT** — `x`, soft-clipped (`tanh`) and DC-blocked. **SPIKE** — a
 10 V / ~1 ms pulse per spike (so a burst emits a little flurry of triggers).
@@ -193,13 +201,14 @@ window the trail never quite repeats. The faint diagonal is the `z`-nullcline
 
 `tools/soma_stability_test.cpp` (calibration/stability/pitch) and
 `tools/soma_render_wav.cpp` (offline audition) are the Soma counterparts of Axon's
-tools. The same notes as Axon apply (state not saved, pitch approximate, spikes
-alias at high notes, OUT DC-blocked / Z not).
+tools. The same notes as Axon apply (state not saved, pitch approximate, OUT
+DC-blocked / Z not, and the same right-click **Anti-aliasing** oversampling
+option for high notes).
 
 ## Deferred
 
-Hard-sync / reset input; closed-loop pitch tracking; per-spike velocity output;
-a regime/MODE switch to recalibrate pitch to the burst (vs spike) rate.
+Closed-loop pitch tracking; per-spike velocity output; a regime/MODE switch to
+recalibrate pitch to the burst (vs spike) rate.
 
 ## Polyphony
 

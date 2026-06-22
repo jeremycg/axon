@@ -3,6 +3,21 @@
 All notable changes to this plugin are documented here. Versions follow the
 Rack-2 `MAJOR.MINOR.REVISION` convention.
 
+## 2.3.0
+
+- **Hard sync** — a new **SYNC** input on both modules. A rising edge re-seeds
+  that voice at the rest fixed point; the resulting state discontinuity is the
+  classic hard-sync sound, and it tightens rhythmic locking when clocked. The
+  input is polyphonic (per-voice reset), and the bottom I/O row was widened from
+  five to six jacks to make room. (Existing patches keep working — SYNC is a new
+  port appended to the list, so saved port wiring is unchanged.)
+- **Anti-aliasing** — an optional oversampling stage. The full output chain
+  (DC-block → tanh soft-clip) now runs in an oversampled inner loop and is
+  decimated with a windowed-sinc FIR, so both the sharp spike *and* the tanh
+  nonlinearity are band-limited before they hit the output. Right-click ▸
+  **Anti-aliasing**: Off / ×4 / ×8, default **×4**. The setting is saved per
+  instance. (×4/×8 cost more CPU, scaling with voice count.)
+
 ## 2.2.0
 
 - **Polyphony** — both Axon and Soma are now polyphonic, up to 16 independent

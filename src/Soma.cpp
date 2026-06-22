@@ -45,6 +45,7 @@ struct Soma : Module {
         CURRENT_INPUT,
         BURST_INPUT,
         TRIG_INPUT,
+        SYNC_INPUT,
         INPUTS_LEN
     };
 
@@ -64,11 +65,20 @@ struct Soma : Module {
     float xx[MAX_POLY], yy[MAX_POLY], zz[MAX_POLY];  // HR state per voice
     float trigPulse[MAX_POLY] = {};
     dsp::SchmittTrigger trigIn[MAX_POLY];
+    dsp::SchmittTrigger syncIn[MAX_POLY];     // SYNC edge detector (hard reset to rest)
     dsp::SchmittTrigger spikeDet[MAX_POLY];
     dsp::PulseGenerator spikeGen[MAX_POLY];
     dsp::TRCFilter<float> dcBlock[MAX_POLY];
+    // Anti-aliasing decimators (one per voice; only the active factor is used).
+    // The whole output chain — DC-block then tanh soft-clip — runs oversampled
+    // and is decimated here, so the sharp spikes and the tanh nonlinearity are
+    // band-limited before reaching the output sample.
+    dsp::Decimator<4, 8> decim4[MAX_POLY];
+    dsp::Decimator<8, 8> decim8[MAX_POLY];
+    int   oversampleMode = 1;         // 0 = off, 1 = ×4, 2 = ×8 (right-click menu)
     int   channels = 1;               // active voice count
     float lastFs = 0.f;
+    int   lastOs = 0;                 // detects oversample change to refresh coefficients
     float trigDecay = 0.f;            // cached per-sample TRIG pulse decay (fn of fs)
     float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
 
@@ -119,6 +129,7 @@ struct Soma : Module {
         configInput(CURRENT_INPUT, "Current CV");
         configInput(BURST_INPUT, "Burst rate CV");
         configInput(TRIG_INPUT, "Trigger (fire a burst)");
+        configInput(SYNC_INPUT, "Sync (hard reset to rest)");
 
         configOutput(OUT_OUTPUT, "Audio (membrane potential x)");
         configOutput(SPIKE_OUTPUT, "Spike (trigger on each spike)");
@@ -130,8 +141,20 @@ struct Soma : Module {
     void onReset() override {
         for (int c = 0; c < MAX_POLY; c++) {
             xx[c] = -1.6f; yy[c] = -11.8f; zz[c] = 2.f; trigPulse[c] = 0.f;
-            trigIn[c].reset(); spikeDet[c].reset(); spikeGen[c].reset(); dcBlock[c].reset();
+            trigIn[c].reset(); syncIn[c].reset(); spikeDet[c].reset(); spikeGen[c].reset();
+            dcBlock[c].reset(); decim4[c].reset(); decim8[c].reset();
         }
+    }
+
+    json_t* dataToJson() override {
+        json_t* root = json_object();
+        json_object_set_new(root, "oversample", json_integer(oversampleMode));
+        return root;
+    }
+
+    void dataFromJson(json_t* root) override {
+        if (json_t* j = json_object_get(root, "oversample"))
+            oversampleMode = (int) json_integer_value(j);
     }
 
     // HR derivatives — the FHN f() with one extra (slow) line, as the Axon plan
@@ -157,14 +180,20 @@ struct Soma : Module {
 
     void process(const ProcessArgs& args) override {
         const float fs = args.sampleRate;
+        const int os = oversampleMode == 0 ? 1 : (oversampleMode == 1 ? 4 : 8);
 
-        // SR-derived coefficients, recomputed only on a sample-rate change (no
-        // onSampleRateChange handler needed). Caching trigDecay keeps a
+        // SR/oversample-derived coefficients, recomputed only when fs or the
+        // oversample factor changes. The DC-blocker runs in the oversampled
+        // domain, so its cutoff is referenced to the oversampled rate (fs·os) to
+        // keep the real-time corner at ~20 Hz. Caching trigDecay keeps a
         // transcendental off the per-sample path.
-        if (fs != lastFs) {
-            for (int c = 0; c < MAX_POLY; c++) dcBlock[c].setCutoffFreq(20.f / fs);
+        if (fs != lastFs || os != lastOs) {
+            for (int c = 0; c < MAX_POLY; c++) dcBlock[c].setCutoffFreq(20.f / (fs * os));
             trigDecay = std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
+            if (os != lastOs)
+                for (int c = 0; c < MAX_POLY; c++) { decim4[c].reset(); decim8[c].reset(); }
             lastFs = fs;
+            lastOs = os;
         }
 
         // Voice count follows V/OCT, falling back to TRIG so a poly trigger
@@ -195,6 +224,12 @@ struct Soma : Module {
                        + inputs[BURST_INPUT].getPolyVoltage(c) * rAtt * CV_DEPTH;
             float r = clamp(std::exp2(rLog), R_MIN, R_MAX);
 
+            // ── hard sync: a rising edge re-seeds the voice at the rest fixed
+            // point (all three state variables). The discontinuity is the sync. ──
+            if (syncIn[c].process(inputs[SYNC_INPUT].getPolyVoltage(c), 0.1f, 1.f)) {
+                xx[c] = -1.6f; yy[c] = -11.8f; zz[c] = 2.f;
+            }
+
             // ── excitable trigger: rising edge injects a decaying current pulse ──
             if (trigIn[c].process(inputs[TRIG_INPUT].getPolyVoltage(c), 0.1f, 1.f))
                 trigPulse[c] = TRIG_AMP;
@@ -206,31 +241,39 @@ struct Soma : Module {
             float pitchHz = dsp::FREQ_C4 * std::exp2(
                                 pitchKnob + inputs[VOCT_INPUT].getPolyVoltage(c));
             float dtau = RATE_CAL * pitchHz / fs;
-            int   K    = clamp((int) std::ceil(dtau / HSUB_MAX), MIN_SUB, MAX_SUB);
-            float h    = dtau / K;
+            float subTau = dtau / os;                             // advance per oversampled sample
+            int   K = clamp((int) std::ceil(subTau / HSUB_MAX), MIN_SUB, MAX_SUB);
+            float h = subTau / K;
 
-            // ── integrate K RK4 substeps ──
+            // ── render os oversampled samples (full output chain each), decimate ──
             float x = xx[c], y = yy[c], z = zz[c];
-            for (int k = 0; k < K; k++)
-                rk4(x, y, z, h, Itot, r, s);
+            float osBuf[8];
+            for (int o = 0; o < os; o++) {
+                for (int k = 0; k < K; k++)
+                    rk4(x, y, z, h, Itot, r, s);
 
-            // ── backstop ──
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
-                x = -1.6f; y = -11.8f; z = 2.f;
+                // Backstop.
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+                    x = -1.6f; y = -11.8f; z = 2.f;
+                }
+                x = clamp(x, -STATE_MAX, STATE_MAX);
+                y = clamp(y, -STATE_MAX, STATE_MAX);
+                z = clamp(z, -STATE_MAX, STATE_MAX);
+
+                if (spikeDet[c].process(x, 0.f, SPIKE_THRESH))
+                    spikeGen[c].trigger(1e-3f);
+
+                dcBlock[c].process(x + antiDenorm);
+                osBuf[o] = 5.f * std::tanh(dcBlock[c].highpass() * OUT_GAIN);
             }
-            x = clamp(x, -STATE_MAX, STATE_MAX);
-            y = clamp(y, -STATE_MAX, STATE_MAX);
-            z = clamp(z, -STATE_MAX, STATE_MAX);
             xx[c] = x; yy[c] = y; zz[c] = z;
 
+            float audio = os == 1 ? osBuf[0]
+                        : (os == 4 ? decim4[c].process(osBuf) : decim8[c].process(osBuf));
+
             // ── outputs ──
-            dcBlock[c].process(x + antiDenorm);
-            outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock[c].highpass() * OUT_GAIN), c);
-
-            if (spikeDet[c].process(x, 0.f, SPIKE_THRESH))
-                spikeGen[c].trigger(1e-3f);
+            outputs[OUT_OUTPUT].setVoltage(audio, c);
             outputs[SPIKE_OUTPUT].setVoltage(spikeGen[c].process(args.sampleTime) ? 10.f : 0.f, c);
-
             // Z is the slow adaptation variable — a burst-envelope CV (not high-passed).
             outputs[Z_OUTPUT].setVoltage(clamp((z - Z_CENTER) * Z_GAIN, -5.f, 5.f), c);
         }
@@ -417,11 +460,12 @@ struct SomaWidget : ModuleWidget {
         lbl(24.32f, 90.f, 1.7f, dim, "I CV");
         lbl(39.64f, 90.f, 1.7f, dim, "r CV");
 
-        lbl( 7.5f, 118.5f, 1.7f, dim,    "V/OCT");
-        lbl(19.f,  118.5f, 1.7f, dim,    "TRIG");
-        lbl(34.f,  118.5f, 1.8f, outclr, "OUT");
-        lbl(45.5f, 118.5f, 1.7f, outclr, "SPIKE");
-        lbl(56.f,  118.5f, 1.8f, outclr, "Z");
+        lbl( 6.5f, 118.5f, 1.6f, dim,    "V/OCT");
+        lbl(15.5f, 118.5f, 1.7f, dim,    "TRIG");
+        lbl(24.5f, 118.5f, 1.7f, dim,    "SYNC");
+        lbl(36.5f, 118.5f, 1.8f, outclr, "OUT");
+        lbl(45.5f, 118.5f, 1.6f, outclr, "SPIKE");
+        lbl(54.5f, 118.5f, 1.8f, outclr, "Z");
 
         nvgRestore(args.vg);
     }
@@ -451,11 +495,20 @@ struct SomaWidget : ModuleWidget {
         addInput(createInputCentered<PJ301MPort>( mm2px(Vec(24.32f, 84.f)), module, Soma::CURRENT_INPUT));
         addInput(createInputCentered<PJ301MPort>( mm2px(Vec(39.64f, 84.f)), module, Soma::BURST_INPUT));
 
-        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec( 7.5f, 112.f)), module, Soma::VOCT_INPUT));
-        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec(19.f,  112.f)), module, Soma::TRIG_INPUT));
-        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(34.f,  112.f)), module, Soma::OUT_OUTPUT));
+        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec( 6.5f, 112.f)), module, Soma::VOCT_INPUT));
+        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec(15.5f, 112.f)), module, Soma::TRIG_INPUT));
+        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec(24.5f, 112.f)), module, Soma::SYNC_INPUT));
+        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(36.5f, 112.f)), module, Soma::OUT_OUTPUT));
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(45.5f, 112.f)), module, Soma::SPIKE_OUTPUT));
-        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(56.f,  112.f)), module, Soma::Z_OUTPUT));
+        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(54.5f, 112.f)), module, Soma::Z_OUTPUT));
+    }
+
+    void appendContextMenu(Menu* menu) override {
+        Soma* m = dynamic_cast<Soma*>(module);
+        if (!m) return;
+        menu->addChild(new MenuSeparator);
+        menu->addChild(createIndexPtrSubmenuItem("Anti-aliasing",
+            {"Off", "×4 oversampling", "×8 oversampling"}, &m->oversampleMode));
     }
 };
 

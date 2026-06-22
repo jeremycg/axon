@@ -43,6 +43,7 @@ struct Axon : Module {
         CURRENT_INPUT,
         EPS_INPUT,
         TRIG_INPUT,
+        SYNC_INPUT,
         INPUTS_LEN
     };
 
@@ -65,11 +66,20 @@ struct Axon : Module {
     float vv[MAX_POLY], ww[MAX_POLY];          // FHN state per voice
     float trigPulse[MAX_POLY] = {};            // decaying injected current from TRIG
     dsp::SchmittTrigger trigIn[MAX_POLY];      // TRIG edge detector (hysteresis window)
+    dsp::SchmittTrigger syncIn[MAX_POLY];      // SYNC edge detector (hard reset to rest)
     dsp::SchmittTrigger spikeDet[MAX_POLY];    // detects v crossing SPIKE_THRESH upward
     dsp::PulseGenerator spikeGen[MAX_POLY];    // shapes the SPIKE output pulse
     dsp::TRCFilter<float> dcBlock[MAX_POLY];   // DC blocker on OUT (limit-cycle mean ≠ 0)
+    // Anti-aliasing decimators (one per voice; only the active factor is used).
+    // The whole output chain — DC-block then tanh soft-clip — runs in the
+    // oversampled domain and is decimated here, so both the sharp spike and the
+    // tanh nonlinearity are band-limited before they reach the output sample.
+    dsp::Decimator<4, 8> decim4[MAX_POLY];
+    dsp::Decimator<8, 8> decim8[MAX_POLY];
+    int   oversampleMode = 1;         // 0 = off, 1 = ×4, 2 = ×8 (right-click menu)
     int   channels = 1;               // active voice count
     float lastFs = 0.f;               // detects SR change to refresh coefficients
+    int   lastOs = 0;                 // detects oversample change to refresh coefficients
     float trigDecay = 0.f;            // cached per-sample TRIG pulse decay (fn of fs)
     float antiDenorm = 1e-18f;        // alternating sub-LSB dither, anti-denormal on dcBlock
 
@@ -117,6 +127,7 @@ struct Axon : Module {
         configInput(CURRENT_INPUT, "Current CV");
         configInput(EPS_INPUT, "ε CV");
         configInput(TRIG_INPUT, "Trigger (fire a spike)");
+        configInput(SYNC_INPUT, "Sync (hard reset to rest)");
 
         configOutput(OUT_OUTPUT, "Audio (membrane voltage v)");
         configOutput(SPIKE_OUTPUT, "Spike (trigger on each spike)");
@@ -128,8 +139,20 @@ struct Axon : Module {
     void onReset() override {
         for (int c = 0; c < MAX_POLY; c++) {
             vv[c] = -1.2f; ww[c] = -0.6f; trigPulse[c] = 0.f;
-            trigIn[c].reset(); spikeDet[c].reset(); spikeGen[c].reset(); dcBlock[c].reset();
+            trigIn[c].reset(); syncIn[c].reset(); spikeDet[c].reset(); spikeGen[c].reset();
+            dcBlock[c].reset(); decim4[c].reset(); decim8[c].reset();
         }
+    }
+
+    json_t* dataToJson() override {
+        json_t* root = json_object();
+        json_object_set_new(root, "oversample", json_integer(oversampleMode));
+        return root;
+    }
+
+    void dataFromJson(json_t* root) override {
+        if (json_t* j = json_object_get(root, "oversample"))
+            oversampleMode = (int) json_integer_value(j);
     }
 
     // FHN derivatives in dimensionless time. Factored so a Hindmarsh-Rose
@@ -153,14 +176,20 @@ struct Axon : Module {
 
     void process(const ProcessArgs& args) override {
         const float fs = args.sampleRate;
+        const int os = oversampleMode == 0 ? 1 : (oversampleMode == 1 ? 4 : 8);
 
-        // SR-derived coefficients, recomputed only on a sample-rate change (no
-        // onSampleRateChange handler needed). Caching trigDecay keeps a
+        // SR/oversample-derived coefficients, recomputed only when fs or the
+        // oversample factor changes. The DC-blocker runs in the oversampled
+        // domain, so its cutoff is referenced to the oversampled rate (fs·os) to
+        // keep the real-time corner at ~20 Hz. Caching trigDecay keeps a
         // transcendental off the per-sample path.
-        if (fs != lastFs) {
-            for (int c = 0; c < MAX_POLY; c++) dcBlock[c].setCutoffFreq(20.f / fs);
+        if (fs != lastFs || os != lastOs) {
+            for (int c = 0; c < MAX_POLY; c++) dcBlock[c].setCutoffFreq(20.f / (fs * os));
             trigDecay = std::exp(-1.f / (TRIG_TAU_MS * 1e-3f * fs));
+            if (os != lastOs)
+                for (int c = 0; c < MAX_POLY; c++) { decim4[c].reset(); decim8[c].reset(); }
             lastFs = fs;
+            lastOs = os;
         }
 
         // Voice count follows V/OCT, but fall back to TRIG so a poly trigger
@@ -194,6 +223,12 @@ struct Axon : Module {
                       + inputs[CURRENT_INPUT].getPolyVoltage(c) * Iatt * CV_DEPTH;
             if (c == 0) I0 = I;
 
+            // ── hard sync: a rising edge re-seeds the voice at the rest fixed
+            // point. The resulting state discontinuity is the sync sound. ──
+            if (syncIn[c].process(inputs[SYNC_INPUT].getPolyVoltage(c), 0.1f, 1.f)) {
+                vv[c] = -1.2f; ww[c] = -0.6f;
+            }
+
             // ── excitable trigger: rising edge injects a decaying current pulse ──
             // Hysteresis window (0.1..1V) so a DC-coupled / offset trigger can't latch.
             if (trigIn[c].process(inputs[TRIG_INPUT].getPolyVoltage(c), 0.1f, 1.f))
@@ -206,29 +241,40 @@ struct Axon : Module {
             float pitchHz = dsp::FREQ_C4 * std::exp2(
                                 pitchKnob + inputs[VOCT_INPUT].getPolyVoltage(c));
             float dtau = RATE_CAL * pitchHz / fs;                 // dimensionless advance / sample
-            int   K    = clamp((int) std::ceil(dtau / HSUB_MAX), MIN_SUB, MAX_SUB);
-            float h    = dtau / K;
+            float subTau = dtau / os;                             // advance per oversampled sample
+            int   K = clamp((int) std::ceil(subTau / HSUB_MAX), MIN_SUB, MAX_SUB);
+            float h = subTau / K;
 
-            // ── integrate K RK4 substeps ──
+            // ── render os oversampled samples, full output chain each, then
+            // decimate. K RK4 substeps per oversampled sample hold the stiff
+            // spike accurate; DC-block + tanh band-limited before decimation. ──
             float v = vv[c], w = ww[c];
-            for (int k = 0; k < K; k++)
-                rk4(v, w, h, Itot, eps, a);
+            float osBuf[8];
+            for (int o = 0; o < os; o++) {
+                for (int k = 0; k < K; k++)
+                    rk4(v, w, h, Itot, eps, a);
 
-            // ── backstop: nonlinear systems can run away if pushed ──
-            if (!std::isfinite(v) || !std::isfinite(w)) { v = -1.2f; w = -0.6f; }
-            v = clamp(v, -STATE_MAX, STATE_MAX);
-            w = clamp(w, -STATE_MAX, STATE_MAX);
+                // Backstop: nonlinear systems can run away if pushed.
+                if (!std::isfinite(v) || !std::isfinite(w)) { v = -1.2f; w = -0.6f; }
+                v = clamp(v, -STATE_MAX, STATE_MAX);
+                w = clamp(w, -STATE_MAX, STATE_MAX);
+
+                // Spike detect on the oversampled stream so fast spikes aren't
+                // missed; hysteresis (two-arg) keeps it to one pulse per spike.
+                if (spikeDet[c].process(v, 0.f, SPIKE_THRESH))
+                    spikeGen[c].trigger(1e-3f);
+
+                dcBlock[c].process(v + antiDenorm);
+                osBuf[o] = 5.f * std::tanh(dcBlock[c].highpass() * OUT_GAIN);
+            }
             vv[c] = v; ww[c] = w;
 
+            float audio = os == 1 ? osBuf[0]
+                        : (os == 4 ? decim4[c].process(osBuf) : decim8[c].process(osBuf));
+
             // ── outputs ──
-            dcBlock[c].process(v + antiDenorm);
-            outputs[OUT_OUTPUT].setVoltage(5.f * std::tanh(dcBlock[c].highpass() * OUT_GAIN), c);
-
-            // Two-arg Schmitt gives hysteresis so a noisy peak emits one pulse.
-            if (spikeDet[c].process(v, 0.f, SPIKE_THRESH))
-                spikeGen[c].trigger(1e-3f);
+            outputs[OUT_OUTPUT].setVoltage(audio, c);
             outputs[SPIKE_OUTPUT].setVoltage(spikeGen[c].process(args.sampleTime) ? 10.f : 0.f, c);
-
             // W is a slow correlated CV — intentionally not high-passed.
             outputs[W_OUTPUT].setVoltage(clamp(w * W_GAIN, -5.f, 5.f), c);
         }
@@ -445,12 +491,13 @@ struct AxonWidget : ModuleWidget {
         lbl(24.32f, 90.f, 1.7f, dim, "I CV");
         lbl(39.64f, 90.f, 1.7f, dim, "ε CV");
 
-        // I/O row labels (row at y=112)
-        lbl( 7.5f, 118.5f, 1.7f, dim,    "V/OCT");
-        lbl(19.f,  118.5f, 1.7f, dim,    "TRIG");
-        lbl(34.f,  118.5f, 1.8f, outclr, "OUT");
-        lbl(45.5f, 118.5f, 1.7f, outclr, "SPIKE");
-        lbl(56.f,  118.5f, 1.8f, outclr, "W");
+        // I/O row labels (row at y=112): three inputs | three outputs
+        lbl( 6.5f, 118.5f, 1.6f, dim,    "V/OCT");
+        lbl(15.5f, 118.5f, 1.7f, dim,    "TRIG");
+        lbl(24.5f, 118.5f, 1.7f, dim,    "SYNC");
+        lbl(36.5f, 118.5f, 1.8f, outclr, "OUT");
+        lbl(45.5f, 118.5f, 1.6f, outclr, "SPIKE");
+        lbl(54.5f, 118.5f, 1.8f, outclr, "W");
 
         nvgRestore(args.vg);
     }
@@ -483,12 +530,21 @@ struct AxonWidget : ModuleWidget {
         addInput(createInputCentered<PJ301MPort>( mm2px(Vec(24.32f, 84.f)), module, Axon::CURRENT_INPUT));
         addInput(createInputCentered<PJ301MPort>( mm2px(Vec(39.64f, 84.f)), module, Axon::EPS_INPUT));
 
-        // I/O row (y=112): V/OCT, TRIG (in) | OUT, SPIKE, W (out)
-        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec( 7.5f, 112.f)), module, Axon::VOCT_INPUT));
-        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec(19.f,  112.f)), module, Axon::TRIG_INPUT));
-        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(34.f,  112.f)), module, Axon::OUT_OUTPUT));
+        // I/O row (y=112): V/OCT, TRIG, SYNC (in) | OUT, SPIKE, W (out)
+        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec( 6.5f, 112.f)), module, Axon::VOCT_INPUT));
+        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec(15.5f, 112.f)), module, Axon::TRIG_INPUT));
+        addInput(createInputCentered<PJ301MPort>(  mm2px(Vec(24.5f, 112.f)), module, Axon::SYNC_INPUT));
+        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(36.5f, 112.f)), module, Axon::OUT_OUTPUT));
         addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(45.5f, 112.f)), module, Axon::SPIKE_OUTPUT));
-        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(56.f,  112.f)), module, Axon::W_OUTPUT));
+        addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(54.5f, 112.f)), module, Axon::W_OUTPUT));
+    }
+
+    void appendContextMenu(Menu* menu) override {
+        Axon* m = dynamic_cast<Axon*>(module);
+        if (!m) return;
+        menu->addChild(new MenuSeparator);
+        menu->addChild(createIndexPtrSubmenuItem("Anti-aliasing",
+            {"Off", "×4 oversampling", "×8 oversampling"}, &m->oversampleMode));
     }
 };
 

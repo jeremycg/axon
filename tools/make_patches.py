@@ -29,6 +29,25 @@ def vco(freq=0.0, pos=(0, 0)):
     return {"id": uid(), "plugin": "Fundamental", "model": "VCO", "version": "2.6.4",
             "params": [{"id": 2, "value": float(freq)}], "pos": list(pos)}
 
+# ── Poly-source utilities (verified from Fundamental v2 source) ────────────────
+#   8vert : GAIN_PARAMS 0..7; IN_INPUTS 0..7; OUT_OUTPUTS 0..7.  With an output
+#           connected but its input unpatched, out = gain*10 V (a mono constant) — so
+#           the gain knob doubles as a fixed V/oct source. 8 HP.
+#   Merge : MONO_INPUTS 0..15; POLY_OUTPUT 0. Channels auto = last connected +1. 2 HP.
+#   Sum   : LEVEL_PARAM 0 (0..1); POLY_INPUT 0; MONO_OUTPUT 0. out = sum(poly)*level. 2 HP.
+def eightvert(gains, pos):
+    params = [{"id": i, "value": float(gains[i] if i < len(gains) else 0.0)} for i in range(8)]
+    return {"id": uid(), "plugin": "Fundamental", "model": "8vert", "version": "2.6.4",
+            "params": params, "pos": list(pos)}
+
+def merge(pos):
+    return {"id": uid(), "plugin": "Fundamental", "model": "Merge", "version": "2.6.4",
+            "params": [], "pos": list(pos)}
+
+def summ(level, pos):
+    return {"id": uid(), "plugin": "Fundamental", "model": "Sum", "version": "2.6.4",
+            "params": [{"id": 0, "value": float(level)}], "pos": list(pos)}
+
 def ap(pitch=0.0, current=0.6, eps=0.08, shape=0.7, current_att=0.0, eps_att=0.0):
     return [
         {"id": 0, "value": float(pitch)},
@@ -131,6 +150,23 @@ def patch_sync():
     ]
     write_patch("axon_5_sync.vcv", [master, x, a], cs, a["id"])
 
+# ── 6. Polyphony: a held 4-voice chord lights up the multi-hue display ─────────
+def patch_poly():
+    semis = [0, 4, 7, 11]                                   # Cmaj7 (V/oct = semis/12)
+    ev = eightvert([s / 120.0 for s in semis], (0, 0))     # 8 HP; out = gain*10 V
+    mg = merge((8, 0))                                      # 2 HP
+    x  = axon(ap(current=0.6, eps=0.08, shape=0.7), [10, 0])  # 12 HP → 4 voices
+    sm = summ(0.25, (22, 0))                               # 2 HP; tame 4×±5 V
+    a  = audio([24, 0])
+    cs = [cable(ev["id"], i, mg["id"], i, i) for i in range(4)]  # 8VERT outs -> Merge ins
+    cs += [
+        cable(mg["id"], 0, x["id"], 0, 4),    # Merge POLY -> Axon V/OCT (4 ch)
+        cable(x["id"], 0, sm["id"], 0, 5),    # Axon OUT (poly) -> Sum
+        cable(sm["id"], 0, a["id"], 0, 6),    # Sum -> L
+        cable(sm["id"], 0, a["id"], 1, 7),    # Sum -> R
+    ]
+    write_patch("axon_6_poly.vcv", [ev, mg, x, sm, a], cs, a["id"])
+
 # ── Soma (Hindmarsh-Rose) ─────────────────────────────────────────────────────
 # Soma positional ids (match enum order in src/Soma.cpp):
 #   ParamId : 0 PITCH, 1 CURRENT, 2 BURST(=log2 r), 3 ADAPT, 4 CURRENT_ATT, 5 BURST_ATT
@@ -201,10 +237,28 @@ def patch_soma_sync():
     ]
     write_patch("soma_5_sync.vcv", [lfo, x, a], cs, a["id"])
 
+# ── 6. Polyphony: a held 4-voice chord, each voice bursting independently ──────
+def patch_soma_poly():
+    semis = [0, 3, 7, 10]                                   # Cmin7
+    ev = eightvert([s / 120.0 for s in semis], (0, 0))
+    mg = merge((8, 0))
+    x  = soma(sp(current=2.0, r=0.006, adapt=4.0), [10, 0])  # 4 voices, each bursting
+    sm = summ(0.3, (22, 0))
+    a  = audio([24, 0])
+    cs = [cable(ev["id"], i, mg["id"], i, i) for i in range(4)]
+    cs += [
+        cable(mg["id"], 0, x["id"], 0, 4),    # Merge POLY -> Soma V/OCT
+        cable(x["id"], 0, sm["id"], 0, 5),    # Soma OUT (poly) -> Sum
+        cable(sm["id"], 0, a["id"], 0, 6),    # Sum -> L
+        cable(sm["id"], 0, a["id"], 1, 7),    # Sum -> R
+    ]
+    write_patch("soma_6_poly.vcv", [ev, mg, x, sm, a], cs, a["id"])
+
 if __name__ == "__main__":
     print("Generating Axon smoke-test patches:")
-    patch_freerun(); patch_blips(); patch_selfevolving(); patch_crossmod(); patch_sync()
+    patch_freerun(); patch_blips(); patch_selfevolving(); patch_crossmod()
+    patch_sync(); patch_poly()
     print("Generating Soma smoke-test patches:")
     patch_soma_bursting(); patch_soma_chaos(); patch_soma_blips(); patch_soma_zmod()
-    patch_soma_sync()
+    patch_soma_sync(); patch_soma_poly()
     print("Done.")

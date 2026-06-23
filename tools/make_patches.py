@@ -150,22 +150,30 @@ def patch_sync():
     ]
     write_patch("axon_5_sync.vcv", [master, x, a], cs, a["id"])
 
-# ── 6. Polyphony: a held 4-voice chord lights up the multi-hue display ─────────
+# ── 6. Polyphony: 4 voices spread across PITCH *and* CURRENT ───────────────────
+# The phase portrait is pitch-invariant (pitch only rescales time), so voices at
+# the same CURRENT trace the same orbit and pile up. Driving a second poly CV into
+# CURRENT gives each voice a differently-sized limit cycle — that is what makes the
+# coloured orbits visibly separate on the display.
 def patch_poly():
-    semis = [0, 4, 7, 11]                                   # Cmaj7 (V/oct = semis/12)
-    ev = eightvert([s / 120.0 for s in semis], (0, 0))     # 8 HP; out = gain*10 V
-    mg = merge((8, 0))                                      # 2 HP
-    x  = axon(ap(current=0.6, eps=0.08, shape=0.7), [10, 0])  # 12 HP → 4 voices
-    sm = summ(0.25, (22, 0))                               # 2 HP; tame 4×±5 V
-    a  = audio([24, 0])
-    cs = [cable(ev["id"], i, mg["id"], i, i) for i in range(4)]  # 8VERT outs -> Merge ins
+    semis  = [0, 4, 7, 11]                                  # Cmaj7 pitches
+    cur_cv = [-1.5, 1.0, 4.0, 7.5]                          # ×0.1 → I ≈ 0.45,0.70,1.00,1.35
+    evP = eightvert([s / 120.0 for s in semis], (0, 0))    # pitch source (8 HP)
+    evC = eightvert([v / 10.0 for v in cur_cv], (8, 0))    # current-CV source (8 HP)
+    mgP = merge((16, 0)); mgC = merge((18, 0))             # 2 HP each
+    x   = axon(ap(current=0.6, eps=0.08, shape=0.7, current_att=1.0), [20, 0])
+    sm  = summ(0.25, (32, 0))
+    a   = audio([34, 0])
+    cs  = [cable(evP["id"], i, mgP["id"], i, i) for i in range(4)]   # pitch chord
+    cs += [cable(evC["id"], i, mgC["id"], i, i) for i in range(4)]   # current spread
     cs += [
-        cable(mg["id"], 0, x["id"], 0, 4),    # Merge POLY -> Axon V/OCT (4 ch)
-        cable(x["id"], 0, sm["id"], 0, 5),    # Axon OUT (poly) -> Sum
-        cable(sm["id"], 0, a["id"], 0, 6),    # Sum -> L
-        cable(sm["id"], 0, a["id"], 1, 7),    # Sum -> R
+        cable(mgP["id"], 0, x["id"], 0, 0),   # Merge -> Axon V/OCT (4 ch)
+        cable(mgC["id"], 0, x["id"], 1, 1),   # Merge -> Axon CURRENT CV (att = 1.0)
+        cable(x["id"], 0, sm["id"], 0, 2),    # Axon OUT (poly) -> Sum
+        cable(sm["id"], 0, a["id"], 0, 3),    # Sum -> L
+        cable(sm["id"], 0, a["id"], 1, 3),    # Sum -> R
     ]
-    write_patch("axon_6_poly.vcv", [ev, mg, x, sm, a], cs, a["id"])
+    write_patch("axon_6_poly.vcv", [evP, evC, mgP, mgC, x, sm, a], cs, a["id"])
 
 # ── Soma (Hindmarsh-Rose) ─────────────────────────────────────────────────────
 # Soma positional ids (match enum order in src/Soma.cpp):
@@ -237,22 +245,29 @@ def patch_soma_sync():
     ]
     write_patch("soma_5_sync.vcv", [lfo, x, a], cs, a["id"])
 
-# ── 6. Polyphony: a held 4-voice chord, each voice bursting independently ──────
+# ── 6. Polyphony: 4 voices spread across PITCH *and* CURRENT (tonic→chaos) ──────
+# As with Axon, CURRENT (not pitch) is what separates the (x,z) attractors. The
+# four current values walk from tonic spiking up into the chaotic window, so each
+# coloured voice draws a distinctly different attractor.
 def patch_soma_poly():
-    semis = [0, 3, 7, 10]                                   # Cmin7
-    ev = eightvert([s / 120.0 for s in semis], (0, 0))
-    mg = merge((8, 0))
-    x  = soma(sp(current=2.0, r=0.006, adapt=4.0), [10, 0])  # 4 voices, each bursting
-    sm = summ(0.3, (22, 0))
-    a  = audio([24, 0])
-    cs = [cable(ev["id"], i, mg["id"], i, i) for i in range(4)]
+    semis  = [0, 3, 7, 10]                                  # Cmin7 pitches
+    cur_cv = [-2.5, 0.0, 4.0, 6.25]                         # ×0.2 → I ≈ 1.5,2.0,2.8,3.25
+    evP = eightvert([s / 120.0 for s in semis], (0, 0))
+    evC = eightvert([v / 10.0 for v in cur_cv], (8, 0))
+    mgP = merge((16, 0)); mgC = merge((18, 0))
+    x   = soma(sp(current=2.0, r=0.006, adapt=4.0, current_att=1.0), [20, 0])
+    sm  = summ(0.3, (32, 0))
+    a   = audio([34, 0])
+    cs  = [cable(evP["id"], i, mgP["id"], i, i) for i in range(4)]
+    cs += [cable(evC["id"], i, mgC["id"], i, i) for i in range(4)]
     cs += [
-        cable(mg["id"], 0, x["id"], 0, 4),    # Merge POLY -> Soma V/OCT
-        cable(x["id"], 0, sm["id"], 0, 5),    # Soma OUT (poly) -> Sum
-        cable(sm["id"], 0, a["id"], 0, 6),    # Sum -> L
-        cable(sm["id"], 0, a["id"], 1, 7),    # Sum -> R
+        cable(mgP["id"], 0, x["id"], 0, 0),   # Merge -> Soma V/OCT
+        cable(mgC["id"], 0, x["id"], 1, 1),   # Merge -> Soma CURRENT CV (att = 1.0)
+        cable(x["id"], 0, sm["id"], 0, 2),    # Soma OUT (poly) -> Sum
+        cable(sm["id"], 0, a["id"], 0, 3),    # Sum -> L
+        cable(sm["id"], 0, a["id"], 1, 3),    # Sum -> R
     ]
-    write_patch("soma_6_poly.vcv", [ev, mg, x, sm, a], cs, a["id"])
+    write_patch("soma_6_poly.vcv", [evP, evC, mgP, mgC, x, sm, a], cs, a["id"])
 
 if __name__ == "__main__":
     print("Generating Axon smoke-test patches:")

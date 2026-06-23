@@ -97,8 +97,10 @@ them into the Windows Rack patches folder if present):
 - **axon_4_crossmod** — VCO SAW into CURRENT CV for FM-like sidebands
 - **axon_5_sync** — a master VCO square clocking SYNC: hard sync. Sweep Axon's
   PITCH against the master for the classic sync-sweep timbre
-- **axon_6_poly** — a held 4-voice chord (8VERT → Merge → V/OCT), OUT summed back
-  to mono through Sum: four independent voices, four coloured orbits on the scope
+- **axon_6_poly** — 4 voices spread across both pitch (a chord) and CURRENT, so
+  each traces a differently-sized limit cycle: four coloured orbits on the scope
+  (the portrait is pitch-invariant, so CURRENT is what separates them). OUT is
+  summed back to mono through Sum
 
 ## Notes / known limits
 
@@ -204,8 +206,9 @@ window the trail never quite repeats. The faint diagonal is the `z`-nullcline
 - **soma_4_zmod** — Z self-patched into CURRENT CV: a self-evolving burst texture
 - **soma_5_sync** — an LFO clocking SYNC: each edge restarts the burst, locking it
   to the clock (rhythmic hard reset)
-- **soma_6_poly** — a held 4-voice chord (8VERT → Merge → V/OCT): four cells each
-  bursting at their own rate, summed to mono through Sum
+- **soma_6_poly** — 4 voices spread across pitch and CURRENT, the four currents
+  walking from tonic spiking up into the chaotic window, so each coloured voice
+  draws a distinctly different (x,z) attractor. Summed to mono through Sum
 
 `tools/soma_stability_test.cpp` (calibration/stability/pitch) and
 `tools/soma_render_wav.cpp` (offline audition) are the Soma counterparts of Axon's

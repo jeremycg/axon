@@ -48,6 +48,28 @@ def summ(level, pos):
     return {"id": uid(), "plugin": "Fundamental", "model": "Sum", "version": "2.6.4",
             "params": [{"id": 0, "value": float(level)}], "pos": list(pos)}
 
+# ── Playable-poly utilities (verified from Core / Fundamental v2 source) ───────
+#   MIDIToCVInterface : PITCH_OUTPUT 0, GATE_OUTPUT 1. Poly channel count lives in
+#       midiParser (right-click "Polyphony channels"); the user still selects their
+#       MIDI device. "channels" in data is read by MidiParser.fromJson.
+#   ADSR  : A/D/S/R params 0..3; GATE_INPUT 4; ENVELOPE_OUTPUT 0. Poly via GATE.
+#   VCA-1 : LEVEL_PARAM 0, EXP_PARAM 1; CV_INPUT 0 (0..10 V → 0..1), IN_INPUT 1;
+#       OUT_OUTPUT 0. Poly, follows IN channels.
+def midicv(channels=4, pos=(0, 0)):
+    return {"id": uid(), "plugin": "Core", "model": "MIDIToCVInterface", "version": "2.6.6",
+            "params": [], "data": {"channels": int(channels)}, "pos": list(pos)}
+
+def adsr(a=0.2, d=0.3, s=0.8, r=0.4, pos=(0, 0)):
+    return {"id": uid(), "plugin": "Fundamental", "model": "ADSR", "version": "2.6.4",
+            "params": [{"id": 0, "value": float(a)}, {"id": 1, "value": float(d)},
+                       {"id": 2, "value": float(s)}, {"id": 3, "value": float(r)}],
+            "pos": list(pos)}
+
+def vca1(level=1.0, pos=(0, 0)):
+    return {"id": uid(), "plugin": "Fundamental", "model": "VCA-1", "version": "2.6.4",
+            "params": [{"id": 0, "value": float(level)}, {"id": 1, "value": 0.0}],  # LEVEL, EXP off
+            "pos": list(pos)}
+
 def ap(pitch=0.0, current=0.6, eps=0.08, shape=0.7, current_att=0.0, eps_att=0.0):
     return [
         {"id": 0, "value": float(pitch)},
@@ -175,6 +197,29 @@ def patch_poly():
     ]
     write_patch("axon_6_poly.vcv", [evP, evC, mgP, mgC, x, sm, a], cs, a["id"])
 
+# ── 7. Playable chords: MIDI->CV gates a poly VCA so notes start/stop ──────────
+# Axon free-runs (a drone), so polyphony alone just sounds all voices forever.
+# Gate the audio AFTER Axon: MIDI GATE -> ADSR -> VCA level, so each voice only
+# sounds while its key is held. (Open in Rack, right-click the MIDI module to pick
+# your device and set Polyphony channels to taste.)
+def patch_midipoly():
+    m  = midicv(4, (0, 0))                                  # 8 HP — pick device, poly=4
+    x  = axon(ap(current=0.6, eps=0.08, shape=0.7), [8, 0])   # 12 HP → 4 voices
+    en = adsr(0.2, 0.3, 0.8, 0.4, (20, 0))                 # 6 HP — gentle pad
+    vc = vca1(1.0, (26, 0))                                 # 3 HP
+    sm = summ(0.3, (29, 0))                                 # 2 HP
+    a  = audio([31, 0])
+    cs = [
+        cable(m["id"],  0, x["id"],  0, 0),   # MIDI PITCH -> Axon V/OCT
+        cable(m["id"],  1, en["id"], 4, 1),   # MIDI GATE  -> ADSR GATE
+        cable(x["id"],  0, vc["id"], 1, 2),   # Axon OUT   -> VCA IN
+        cable(en["id"], 0, vc["id"], 0, 3),   # ADSR ENV   -> VCA level CV
+        cable(vc["id"], 0, sm["id"], 0, 4),   # VCA OUT    -> Sum (poly->mono)
+        cable(sm["id"], 0, a["id"],  0, 5),   # Sum -> L
+        cable(sm["id"], 0, a["id"],  1, 5),   # Sum -> R
+    ]
+    write_patch("axon_7_midipoly.vcv", [m, x, en, vc, sm, a], cs, a["id"])
+
 # ── Soma (Hindmarsh-Rose) ─────────────────────────────────────────────────────
 # Soma positional ids (match enum order in src/Soma.cpp):
 #   ParamId : 0 PITCH, 1 CURRENT, 2 BURST(=log2 r), 3 ADAPT, 4 CURRENT_ATT, 5 BURST_ATT
@@ -272,7 +317,7 @@ def patch_soma_poly():
 if __name__ == "__main__":
     print("Generating Axon smoke-test patches:")
     patch_freerun(); patch_blips(); patch_selfevolving(); patch_crossmod()
-    patch_sync(); patch_poly()
+    patch_sync(); patch_poly(); patch_midipoly()
     print("Generating Soma smoke-test patches:")
     patch_soma_bursting(); patch_soma_chaos(); patch_soma_blips(); patch_soma_zmod()
     patch_soma_sync(); patch_soma_poly()

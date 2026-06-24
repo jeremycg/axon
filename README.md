@@ -86,7 +86,7 @@ as CURRENT crosses into the oscillating band. The trail is read lock-free from a
 
 ## Patches
 
-`tools/make_patches.py` writes six smoke-test patches into `patches/` (and copies
+`tools/make_patches.py` writes seven smoke-test patches into `patches/` (and copies
 them into the Windows Rack patches folder if present):
 
 - **axon_1_freerun** — default voicing → audio; play V/OCT
@@ -101,6 +101,10 @@ them into the Windows Rack patches folder if present):
   each traces a differently-sized limit cycle: four coloured orbits on the scope
   (the portrait is pitch-invariant, so CURRENT is what separates them). OUT is
   summed back to mono through Sum
+- **axon_7_midipoly** — a *playable* polyphonic voice: MIDI→CV drives V/OCT, its
+  GATE opens an ADSR→VCA after Axon so notes start/stop (Axon free-runs, so the VCA
+  is what you "play"). Pick your MIDI device and set the module's Polyphony channels
+  in its right-click menu
 
 ## Notes / known limits
 

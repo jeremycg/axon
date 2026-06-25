@@ -1,5 +1,10 @@
 # Axon
 
+> ⚠️ **Moved — this repository is archived.** Axon and its sibling Soma now live
+> in **[Coalescent](https://github.com/jeremycg/coalescent)**, a single VCV Rack 2
+> plugin that bundles GENDYN, Haptik, and the Axon/Soma neuron pair. Development
+> continues there; this repo is kept for history only.
+
 Spiking-neuron oscillators for VCV Rack 2. This plugin contains two sibling
 modules that use the same RK4 integration strategy: **Axon** (FitzHugh–Nagumo — spiking
 and excitable) and **Soma** (Hindmarsh–Rose — bursting and chaos).
